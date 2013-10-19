@@ -1,0 +1,3 @@
+-- |Base.hs
+--
+-- Base combinators and implementation for the PQ
