@@ -4,7 +4,7 @@
 --
 -- Copyright (C) 2013 Serguey Zefirov.
 
-{-# LANGUAGE TypeOperators, TypeFamilies, GADTs, FlexibleInstances #-}
+{-# LANGUAGE TypeOperators, TypeFamilies, GADTs, FlexibleInstances, FlexibleContexts #-}
 
 module Language.PQ.Base
 	( module Language.PQ.Base
@@ -13,6 +13,7 @@ module Language.PQ.Base
 import Control.Monad
 import Control.Monad.State
 
+import Data.Bits
 import Data.List (nub, intersect, isPrefixOf)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
@@ -43,10 +44,38 @@ type instance Max (S a) Z = S a
 type instance Max Z (S b) = S b
 type instance Max (S a) (S b) = S (Max a b)
 
+class Nat n where
+	reifyNat :: n -> Int
+
+instance Nat Z where
+	reifyNat = const 0
+
+instance Nat n => Nat (S n) where
+	reifyNat (S n) = 1 + reifyNat n
+
 -------------------------------------------------------------------------------
 -- Bit-vactor representation for values.
 
--- class BitRepr 
+class Nat (BitReprSize a) => BitRepr a where
+	type BitReprSize a
+
+	safeValue :: a
+	safeValue = decode 0
+
+	encode :: a -> Integer
+	decode :: Integer -> a
+
+	typeSize :: a -> BitReprSize a
+	typeSize = const (error "typeSize!!!")
+
+	reifySize :: a -> Int
+	reifySize = reifyNat . typeSize
+
+instance BitRepr Bool where
+	type BitReprSize Bool = S Z
+	safeValue = False
+	encode = fromIntegral . fromEnum
+	decode = toEnum . fromIntegral . (.&. 1)
 
 -------------------------------------------------------------------------------
 -- Clock information.
@@ -95,18 +124,28 @@ data VarID = VarID (Maybe String) [Int]
 data Expr =
 		EConst	Integer
 	|	EVar	VarID
-	|	EBin	BinOp	SizedExpr	SizedExpr
+	|	EBin	BinOp		SizedExpr	SizedExpr
+	|	ESel	SizedExpr	SizedExpr	SizedExpr
 	|	ECat	[SizedExpr]
 	|	ERead	ChanID
 	deriving (Eq, Ord, Show)
 
-data BinOp = Plus | Minus | Mul | Div | Mod | And | Or | Xor
+data BinOp = Plus | Minus | Mul | Div | Mod | And | Or | Xor | Equal | LessThan | GreaterThan | LessEqual | GreaterEqual
 	deriving (Eq, Ord, Show)
+
+data QE a where
+	QE :: BitRepr a => SizedExpr -> QE a
+
+qeValueSize :: BitRepr a => QE a -> Int
+qeValueSize qe = reifySize (qeValue qe)
+	where
+		qeValue :: QE a -> a
+		qeValue = error "qeValue!"
 
 -------------------------------------------------------------------------------
 -- Defining the processes.
 
-data ChanID = ChanID ClockInfo String
+data ChanID = ChanID Int ClockInfo String
 	deriving (Eq, Ord, Show)
 
 data WChan a = WChan ChanID
@@ -162,14 +201,26 @@ class IOChans ins where
 instance IOChans Nil where
 	inventChans [] = Nil
 
-instance IOChans ins => IOChans (RChan a :. ins) where
-	inventChans (n : ns) = RChan (ChanID defaultClock n) :. inventChans ns
+instance (BitRepr a, IOChans ins) => IOChans (RChan a :. ins) where
+	inventChans (n : ns) = r :. inventChans ns
+		where
+			r = RChan (ChanID size defaultClock n)
+			value :: RChan a -> a
+			value = error "value!"
 
-instance IOChans outs => IOChans (WChan a :. outs) where
-	inventChans (n : ns) = WChan (ChanID defaultClock n) :. inventChans ns
+			size = reifySize (value r)
+
+instance (BitRepr a, IOChans outs) => IOChans (WChan a :. outs) where
+	inventChans (n : ns) = r :. inventChans ns
+		where
+			r = WChan (ChanID size defaultClock n)
+			value :: WChan a -> a
+			value = error "value!"
+
+			size = reifySize (value r)
 
 -------------------------------------------------------------------------------
--- Combinators for users.
+-- Combinators visible to users.
 
 type family INS ins
 type instance INS Nil = Nil
@@ -179,10 +230,13 @@ type family OUTS ins
 type instance OUTS Nil = Nil
 type instance OUTS (i :. is) = WChan i :. OUTS is
 
-process :: String -> [String] -> [String] -> (INS ins -> OUTS outs -> ActionM ()) -> Process ins outs
+process :: (IOChans (INS ins), IOChans (OUTS outs)) => String -> [String] -> [String] -> (INS ins -> OUTS outs -> ActionM ()) -> Process ins outs
 process name insNames outsNames body = Process $ flip execState (startProc name) $ do
 	when (not $ null $ intersect insNames outsNames) $ error "inputs and outputs intersect."
 	when (length (nub insNames) /= length insNames) $ error "duplicate inputs names"
 	when (length (nub outsNames) /= length outsNames) $ error "duplicate outputs names"
-	body undefined undefined
+	body (inventChans insNames) (inventChans outsNames)
+
+select :: BitRepr a => QE Bool -> QE a -> QE a -> QE a
+select (QE c) tqe@(QE t) (QE f) = QE (SE (qeValueSize tqe) $ ESel c t f)
 
