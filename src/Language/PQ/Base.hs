@@ -158,6 +158,7 @@ data ExecPoint = ExecPoint {
 	-- |Served as documentation naming one bit flag variable for this state.
 	  epName		:: Maybe String
 	-- |Unique index - to make sure everything is unique and don't clash.
+	-- This is real identity of the execution point.
 	, epIndex		:: Int
 	-- |List of state successors - most common case is only one state is next and less common for several states with conditions.
 	, epSuccessors	:: Either Int [(Int, SizedExpr)]
@@ -219,6 +220,12 @@ instance (BitRepr a, IOChans outs) => IOChans (WChan a :. outs) where
 
 			size = reifySize (value r)
 
+class Selectable e where
+	selectResult :: QE Bool -> e -> e -> e
+
+instance BitRepr t => Selectable (QE t) where
+	selectResult c x y = select c x y
+
 -------------------------------------------------------------------------------
 -- Combinators visible to users.
 
@@ -240,3 +247,5 @@ process name insNames outsNames body = Process $ flip execState (startProc name)
 select :: BitRepr a => QE Bool -> QE a -> QE a -> QE a
 select (QE c) tqe@(QE t) (QE f) = QE (SE (qeValueSize tqe) $ ESel c t f)
 
+match :: Selectable r => QE e -> [(QE a, r)] -> r
+match e matches = error "match!!!"
