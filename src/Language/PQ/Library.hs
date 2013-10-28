@@ -73,7 +73,7 @@ type AS a = (SOP, EOP, a)
 
 -- |The folding for Avalon streams.
 -- The only possible way to fold such stream in hardware is the left fold.
-foldP :: String -> (QE a -> QE b -> QE a) -> QE a -> Process (AS b :. Nil) (AS a :. Nil)
+foldP :: String -> (QE a -> QE b -> QE a) -> QE a -> Process (AS b :. Nil) (a :. Nil)
 foldP suffix f a0 = process ("fold_"++suffix) ("input" :. Nil) ("output" :. Nil) $ \(input :. Nil) (output :. Nil) -> do
 	t <- def "t"
 	-- all assignments before @loop@ or other state changes or reads or something else
