@@ -79,6 +79,9 @@ foldP suffix f a0 = process ("fold_"++suffix) ("input" :. Nil) ("output" :. Nil)
 	-- all assignments before @loop@ or other state changes or reads or something else
 	-- are optimized into initial values of variables.
 	t $= a0
+	x <- def "x"
 	loop
-		-- write an output, read input and update partial folding value.
-		write output t &&& t $= f t (read input)
+		match (read input)
+			[ pqTup (__, pqEOP, x) --> (write output (f t x) &&& t $= a0)
+			, pqTup (__, __, x) --> (t $= f t x)
+			]
