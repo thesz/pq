@@ -23,7 +23,7 @@ bufP = process "buf" ("input" :. Nil) ("output" :. Nil) $ \(input :. Nil) (outpu
 	t <- def "temp"
 	hasValue <- def "hasValue"
 	loop
-			when hasValue (write output t)
+			on hasValue (write output t)
 		&&& 	((t $= read input &&& hasValue $= pqTrue) ||| hasValue $= pqFalse)
 
 -- |Mapping process.

@@ -154,31 +154,28 @@ data WChan a = WChan ChanID
 data RChan a = RChan ChanID
 	deriving (Eq, Ord, Show)
 
-data ExecPoint = ExecPoint {
-	-- |Served as documentation naming one bit flag variable for this state.
-	  epName		:: Maybe String
-	-- |Unique index - to make sure everything is unique and don't clash.
-	-- This is real identity of the execution point.
-	, epIndex		:: Int
-	-- |List of state successors - most common case is only one state is next and less common for several states with conditions.
-	, epSuccessors	:: Either Int [(Int, SizedExpr)]
-	-- |List of actions done at this point.
-	, epActions		:: [Action]
-	}
+data Action =
+		ANop
+	|	AWrite	ChanID		SizedExpr
+	|	AAssign	SizedExpr	SizedExpr
+	|	AGroup	GroupKind	Action	Action
+	|	AIf	SizedExpr	[Action]	[Action]
+	|	ALoop	[Action]
 	deriving (Eq, Ord, Show)
 
-data Action =
-		AWrite	ChanID		SizedExpr
-	|	AAssign	SizedExpr	SizedExpr
+data GroupKind = SeqActions | ParActions
 	deriving (Eq, Ord, Show)
 
 data Proc = Proc {
 	  procName		:: String
 	, procUnique		:: Int
 	, procSubProcs		:: [Proc]
-	, procExecPoints	:: [ExecPoint]
+	, procActions		:: [Action]
 	}
 	deriving (Eq, Ord, Show)
+
+_addAction :: Action -> ActionM ()
+_addAction act = modify $ \p -> p { procActions = act : procActions p }
 
 data Process ins outs where
 	Process :: Proc -> Process ins outs
@@ -188,13 +185,18 @@ startProc name = Proc {
 	  procName		= name
 	, procUnique		= 0
 	, procSubProcs		= []
-	, procExecPoints	= []
+	, procActions		= []
 	}
 
 type ActionM a = State Proc a
 
 internal :: String -> a
 internal s = error $ "internal error: "++s
+
+unique :: ActionM Int
+unique = do
+	modify $ \p -> p { procUnique = 1 + procUnique p }
+	liftM procUnique get
 
 class IOChans ins where
 	inventChans :: [String] -> ins
@@ -249,3 +251,61 @@ select (QE c) tqe@(QE t) (QE f) = QE (SE (qeValueSize tqe) $ ESel c t f)
 
 match :: Selectable r => QE e -> [(QE a, r)] -> r
 match e matches = error "match!!!"
+
+($=) :: QE a -> QE a -> ActionM ()
+QE v $= QE e = case v of
+	SE _ (EVar _) -> _addAction $ AAssign v e
+	_ -> error $ "assignment into non-var."
+
+def :: BitRepr a => String -> ActionM (QE a)
+def name = do
+	n <- unique
+	let r = QE (SE (qeValueSize r) (EVar (VarID (Just name) [n])))
+	return r
+
+(&&&), (|||) :: ActionM () -> ActionM () -> ActionM ()
+a1 &&& a2 = _group SeqActions a1 a2
+a1 ||| a2 = _group ParActions a1 a2
+
+_group :: GroupKind -> ActionM () -> ActionM () -> ActionM ()
+_group kind a1 a2 = do
+	as <- liftM procActions get
+	let clear = modify $ \p -> p { procActions = [] }
+	clear
+	a1
+	as1 <- liftM procActions get
+	left <- case as1 of
+		[a] -> return a
+		_ -> error "left action is not singleton in group operator."
+	clear
+	a2
+	as2 <- liftM procActions get
+	right <- case as2 of
+		[a] -> return a
+		_ -> error "right action is not singleton in group operation."
+	modify $ \p -> p { procActions = as }
+	_addAction $ AGroup kind left right
+
+write :: WChan a -> QE a -> ActionM ()
+write (WChan chanID) (QE e) = _addAction $ AWrite chanID e
+
+pqTrue, pqFalse :: QE Bool
+pqTrue = QE (SE 1 $ EConst 1)
+pqFalse = QE (SE 1 $ EConst 0)
+
+on :: QE Bool -> ActionM () -> ActionM ()
+on (QE e) act = do
+	before <- liftM procActions get
+	modify $ \p -> p { procActions = [] }
+	act
+	after <- liftM procActions get
+	modify $ \p -> p { procActions = before }
+	_addAction $ AIf e after [ANop]
+
+loop :: ActionM () -> ActionM ()
+loop actions = do
+	before <- liftM procActions get
+	modify $ \p -> p { procActions = [] }
+	actions
+	after <- liftM procActions get
+	modify $ \p -> p { procActions = ALoop after : before }
