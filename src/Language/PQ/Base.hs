@@ -324,9 +324,9 @@ class Tuple a where
 	type TupleLifted a
 	pqTup :: a -> TupleLifted a
 
-instance (BitRepr a, BitRepr b, BitRepr (a,b)) => Tuple (QE a,QE b) where
-	type TupleLifted (QE a,QE b) = QE (a,b)
-	pqTup (QE a,QE b) = QE $ SE (sum $ map seSize [a,b]) $ ECat [a,b]
+--instance (BitRepr a, BitRepr b, BitRepr (a,b)) => Tuple (QE a,QE b) where
+--	type TupleLifted (QE a,QE b) = QE (a,b)
+--	pqTup (QE a,QE b) = QE $ SE (sum $ map seSize [a,b]) $ ECat [a,b]
 
 (-->) :: Selectable r => QE a -> r -> (QE a, r)
 qe --> r = (qe, r)
@@ -334,9 +334,17 @@ qe --> r = (qe, r)
 $(liftM concat $ forM [2..4] $ \n -> let
 		names = map (mkName . ("a" ++) . show) [1..n]
 		tupleTy = foldl AppT (TupleT n) $ map VarT names
+		qeTupleTy = foldl AppT (TupleT n) $ map ((ConT ''QE `AppT`) . VarT) names
 		bitReprSizeFT ty = ConT ''BitReprSize `AppT` ty
 		bitReprI = InstanceD [ClassP ''Nat [bitReprSizeFT tupleTy]] (ConT ''BitRepr `AppT` tupleTy) []
-		tupleI = InstanceD [] (ConT ''Tuple `AppT` tupleTy) []
+		tupleI = InstanceD (ClassP ''BitRepr [tupleTy] : map (\n -> ClassP ''BitRepr [VarT n]) names) (ConT ''Tuple `AppT` qeTupleTy) [pqTupD, tupleLiftedD]
+		sizedExprE size e = ConE 'SE `AppE` size `AppE` e
+		seSizeE se = VarE 'seSize `AppE` se
+		tupleLiftedD = TySynInstD ''TupleLifted [qeTupleTy] (ConT ''QE `AppT` tupleTy)
+		pqTupD = FunD 'pqTup
+			[Clause
+				[TupP $ map (\n -> ConP 'QE [VarP n]) names]
+				(NormalB (ConE 'QE `AppE` (sizedExprE (VarE 'sum `AppE` ListE (map (seSizeE . VarE) names)) (ConE 'ECat `AppE` ListE (map (\n -> VarE n) names))))) []]
 	in return [bitReprI, tupleI]
  )
 
