@@ -5,6 +5,7 @@
 -- Copyright (C) 2013 Serguey Zefirov.
 
 {-# LANGUAGE TypeOperators, TypeFamilies, GADTs, FlexibleInstances, FlexibleContexts #-}
+{-# LANGUAGE TemplateHaskell, UndecidableInstances #-}
 
 module Language.PQ.Base
 	( module Language.PQ.Base
@@ -17,6 +18,8 @@ import Data.Bits
 import Data.List (nub, intersect, isPrefixOf)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
+import Language.Haskell.TH
+import qualified Language.Haskell.TH as TH
 
 -------------------------------------------------------------------------------
 -- HList stuff.
@@ -128,6 +131,7 @@ data Expr =
 	|	ESel	SizedExpr	SizedExpr	SizedExpr
 	|	ECat	[SizedExpr]
 	|	ERead	ChanID
+	|	EWild
 	deriving (Eq, Ord, Show)
 
 data BinOp = Plus | Minus | Mul | Div | Mod | And | Or | Xor | Equal | LessThan | GreaterThan | LessEqual | GreaterEqual
@@ -141,6 +145,9 @@ qeValueSize qe = reifySize (qeValue qe)
 	where
 		qeValue :: QE a -> a
 		qeValue = error "qeValue!"
+
+mkQE :: BitRepr a => Expr -> QE a
+mkQE e = let r = QE (SE (qeValueSize r) e) in r
 
 -------------------------------------------------------------------------------
 -- Defining the processes.
@@ -309,3 +316,31 @@ loop actions = do
 	actions
 	after <- liftM procActions get
 	modify $ \p -> p { procActions = ALoop after : before }
+
+__ :: BitRepr a => QE a
+__ = mkQE EWild
+
+class Tuple a where
+	type TupleLifted a
+	pqTup :: a -> TupleLifted a
+
+instance (BitRepr a, BitRepr b, BitRepr (a,b)) => Tuple (QE a,QE b) where
+	type TupleLifted (QE a,QE b) = QE (a,b)
+	pqTup (QE a,QE b) = QE $ SE (sum $ map seSize [a,b]) $ ECat [a,b]
+
+(-->) :: Selectable r => QE a -> r -> (QE a, r)
+qe --> r = (qe, r)
+
+$(liftM concat $ forM [2..4] $ \n -> let
+		names = map (mkName . ("a" ++) . show) [1..n]
+		tupleTy = foldl AppT (TupleT n) $ map VarT names
+		bitReprSizeFT ty = ConT ''BitReprSize `AppT` ty
+		bitReprI = InstanceD [ClassP ''Nat [bitReprSizeFT tupleTy]] (ConT ''BitRepr `AppT` tupleTy) []
+		tupleI = InstanceD [] (ConT ''Tuple `AppT` tupleTy) []
+	in return [bitReprI, tupleI]
+ )
+
+pqDefs :: Q [Dec] -> Q [Dec]
+pqDefs qdecs = do
+	decs <- qdecs
+	return decs
