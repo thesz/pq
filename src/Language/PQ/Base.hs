@@ -336,8 +336,11 @@ $(liftM concat $ forM [2..4] $ \n -> let
 		tupleTy = foldl AppT (TupleT n) $ map VarT names
 		qeTupleTy = foldl AppT (TupleT n) $ map ((ConT ''QE `AppT`) . VarT) names
 		bitReprSizeFT ty = ConT ''BitReprSize `AppT` ty
-		bitReprI = InstanceD [ClassP ''Nat [bitReprSizeFT tupleTy]] (ConT ''BitRepr `AppT` tupleTy) []
-		tupleI = InstanceD (ClassP ''BitRepr [tupleTy] : map (\n -> ClassP ''BitRepr [VarT n]) names) (ConT ''Tuple `AppT` qeTupleTy) [pqTupD, tupleLiftedD]
+		bitReprSizes = map (\n -> ClassP ''BitRepr [VarT n]) names
+		plusFT a b = ConT ''Plus `AppT` a `AppT` b
+		bitReprI = InstanceD (ClassP ''Nat [bitReprSizeFT tupleTy] : bitReprSizes) (ConT ''BitRepr `AppT` tupleTy)
+			[TySynInstD ''BitReprSize [tupleTy] (foldl1 plusFT (map VarT names))]
+		tupleI = InstanceD (ClassP ''BitRepr [tupleTy] : bitReprSizes) (ConT ''Tuple `AppT` qeTupleTy) [pqTupD, tupleLiftedD]
 		sizedExprE size e = ConE 'SE `AppE` size `AppE` e
 		seSizeE se = VarE 'seSize `AppE` se
 		tupleLiftedD = TySynInstD ''TupleLifted [qeTupleTy] (ConT ''QE `AppT` tupleTy)
