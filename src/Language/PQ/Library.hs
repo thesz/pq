@@ -4,34 +4,37 @@
 --
 -- Copyright (C) 2013 Serguey Zefirov
 
-{-# LANGUAGE TypeOperators, TemplateHaskell #-}
+{-# LANGUAGE TypeOperators, TemplateHaskell, FlexibleContexts, TypeFamilies #-}
 
 module Language.PQ.Library where
+
+import Data.Int
+import Data.Word
 
 import Language.PQ.Base
 
 -- |Simple "identity" process.
-idP :: Process (a :. Nil) (a :. Nil)
+idP :: BitRepr a => Process (a :. Nil) (a :. Nil)
 idP = process "id" ("input" :. Nil) ("output" :. Nil) $ \(input :. Nil) (output :. Nil) -> do
 	x <- def "x"
-	loop
-		x $= read input &&& write output x
+	loop $ do
+		x $= readC input &&& writeC output x
 
 -- |A buffer delay for one clock tick.
-bufP :: Process (a :. Nil) (a :. Nil)
+bufP :: BitRepr a => Process (a :. Nil) (a :. Nil)
 bufP = process "buf" ("input" :. Nil) ("output" :. Nil) $ \(input :. Nil) (output :. Nil) -> do
 	t <- def "temp"
 	hasValue <- def "hasValue"
-	loop
-			on hasValue (write output t)
-		&&& 	((t $= read input &&& hasValue $= pqTrue) ||| hasValue $= pqFalse)
+	loop $ do
+			on hasValue (writeC output t)
+		&&& 	((t $= readC input &&& hasValue $= pqTrue) ||| hasValue $= pqFalse)
 
 -- |Mapping process.
-mapP :: (QE a -> QE b) -> Process (a :. Nil) (b :. Nil)
+mapP :: (BitRepr a, BitRepr b) => (QE a -> QE b) -> Process (a :. Nil) (b :. Nil)
 mapP f = process "map" ("input" :. Nil) ("output" :. Nil) $ \(input :. Nil) (output :. Nil) -> do
 	x <- def "temp"
-	loop
-		x $= read input &&& write output (f x)
+	loop $ do
+		x $= readC input &&& writeC output (f x)
 
 -- |Scanning combinator (see @scanl@ from Haskell Prelude).
 -- The only possible way to scan input is left scan.
@@ -43,15 +46,15 @@ mapP f = process "map" ("input" :. Nil) ("output" :. Nil) $ \(input :. Nil) (out
 -- Given all that, it is easy to produce the running sum circuit:
 --  runningSum = scanP "running_sum" (.+) (constant 0)
 -- It will appear as "scan_running_sum" in the generated code.
-scanP :: String -> (QE a -> QE b -> QE a) -> QE a -> Process (b :. Nil) (a :. Nil)
+scanP :: (BitRepr a, BitRepr b) => String -> (QE a -> QE b -> QE a) -> QE a -> Process (b :. Nil) (a :. Nil)
 scanP suffix f a0 = process ("scan_"++suffix) ("input" :. Nil) ("output" :. Nil) $ \(input :. Nil) (output :. Nil) -> do
 	t <- def "t"
 	-- all assignments before @loop@ or other state changes or reads or something else
 	-- are optimized into initial values of variables.
 	t $= a0
-	loop
+	loop $ do
 		-- write an output, read input and update partial folding value.
-		write output t &&& t $= f t (read input)
+		writeC output t &&& t $= f t (readC input)
 
 $(pqDefs [d|
 
@@ -73,15 +76,17 @@ type AS a = (SOP, EOP, a)
 
 -- |The folding for Avalon streams.
 -- The only possible way to fold such stream in hardware is the left fold.
-foldP :: String -> (QE a -> QE b -> QE a) -> QE a -> Process (AS b :. Nil) (a :. Nil)
+foldP :: (BitRepr b, BitRepr (AS b), BitRepr a) => String -> (QE a -> QE b -> QE a) -> QE a -> Process (AS b :. Nil) (a :. Nil)
 foldP suffix f a0 = process ("fold_"++suffix) ("input" :. Nil) ("output" :. Nil) $ \(input :. Nil) (output :. Nil) -> do
 	t <- def "t"
 	-- all assignments before @loop@ or other state changes or reads or something else
 	-- are optimized into initial values of variables.
 	t $= a0
 	x <- def "x"
-	loop
-		match (read input)
-			[ pqTup (__, pqEOP, x) --> (write output (f t x) &&& t $= a0)
+	loop $ do
+		matchStat (readC input)
+			[ pqTup (__ :: QE SOP, pqEOP, x) --> (writeC output (f t x) &&& (t $= a0))
 			, pqTup (__, __, x) --> (t $= f t x)
 			]
+
+t = foldP "qq" (.+) (constant 10 :: QE Word8)

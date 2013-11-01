@@ -5,7 +5,8 @@
 -- Copyright (C) 2013 Serguey Zefirov.
 
 {-# LANGUAGE TypeOperators, TypeFamilies, GADTs, FlexibleInstances, FlexibleContexts #-}
-{-# LANGUAGE TemplateHaskell, UndecidableInstances #-}
+{-# LANGUAGE TemplateHaskell, UndecidableInstances, PatternGuards, StandaloneDeriving #-}
+{-# LANGUAGE MultiParamTypeClasses, FunctionalDependencies #-}
 
 module Language.PQ.Base
 	( module Language.PQ.Base
@@ -15,9 +16,11 @@ import Control.Monad
 import Control.Monad.State
 
 import Data.Bits
+import Data.Int
 import Data.List (nub, intersect, isPrefixOf)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
+import Data.Word
 import Language.Haskell.TH
 import qualified Language.Haskell.TH as TH
 
@@ -54,7 +57,7 @@ instance Nat Z where
 	reifyNat = const 0
 
 instance Nat n => Nat (S n) where
-	reifyNat (S n) = 1 + reifyNat n
+	reifyNat ~(S n) = 1 + reifyNat n
 
 -------------------------------------------------------------------------------
 -- Bit-vactor representation for values.
@@ -69,16 +72,23 @@ class Nat (BitReprSize a) => BitRepr a where
 	decode :: Integer -> a
 
 	typeSize :: a -> BitReprSize a
-	typeSize = const (error "typeSize!!!")
+	typeSize a = error "typeSize!!!"
 
 	reifySize :: a -> Int
-	reifySize = reifyNat . typeSize
+	reifySize a = reifyNat $ typeSize a
 
 instance BitRepr Bool where
 	type BitReprSize Bool = S Z
 	safeValue = False
 	encode = fromIntegral . fromEnum
 	decode = toEnum . fromIntegral . (.&. 1)
+
+type Dbl a = Plus a a
+
+instance BitRepr Word8 where
+	type BitReprSize Word8 = Dbl (Dbl (Dbl (S Z)))
+	encode = fromIntegral
+	decode = fromIntegral
 
 -------------------------------------------------------------------------------
 -- Clock information.
@@ -130,11 +140,12 @@ data Expr =
 	|	EBin	BinOp		SizedExpr	SizedExpr
 	|	ESel	SizedExpr	SizedExpr	SizedExpr
 	|	ECat	[SizedExpr]
+	|	ESlice	SizedExpr	Int
 	|	ERead	ChanID
 	|	EWild
 	deriving (Eq, Ord, Show)
 
-data BinOp = Plus | Minus | Mul | Div | Mod | And | Or | Xor | Equal | LessThan | GreaterThan | LessEqual | GreaterEqual
+data BinOp = Plus | Minus | Mul | Div | Mod | And | Or | Xor | Equal | NEqual | LessThan | GreaterThan | LessEqual | GreaterEqual
 	deriving (Eq, Ord, Show)
 
 data QE a where
@@ -146,8 +157,55 @@ qeValueSize qe = reifySize (qeValue qe)
 		qeValue :: QE a -> a
 		qeValue = error "qeValue!"
 
-mkQE :: BitRepr a => Expr -> QE a
-mkQE e = let r = QE (SE (qeValueSize r) e) in r
+pqMkQE :: BitRepr a => Expr -> QE a
+pqMkQE e = let r = QE (SE (qeValueSize r) e) in r
+
+infixl 7 ./
+infixl 7 .%
+infixl 7 .*
+infixl 6 .+
+infixl 6 .-
+class Arith a where
+	(.+), (.-), (.*), (./), (.%) :: a -> a -> a
+
+constant :: BitRepr a => a -> QE a
+constant a = pqMkQE $ EConst (encode a)
+
+mkBin :: (BitRepr a, BitRepr b) => BinOp -> QE a -> QE a -> QE b
+mkBin op (QE a) (QE b) = pqMkQE $ EBin op a b
+
+instance (BitRepr a, Arith a) => Arith (QE a) where
+	(.+) = mkBin Plus
+	(.-) = mkBin Minus
+	(.*) = mkBin Mul
+	(./) = mkBin Div
+	(.%) = mkBin Mod
+
+instance Arith Word8 where
+	(.+) = (+)
+	(.-) = (-)
+	(.*) = (*)
+	(./) = div
+	(.%) = mod
+
+class Equal a where
+	type EqResult a
+	(.==), (./=) :: a -> a -> EqResult a
+
+instance (BitRepr a, Equal a) => Equal (QE a) where
+	type EqResult (QE a) = QE Bool
+	(.==) = mkBin Equal
+	(./=) = mkBin NEqual
+
+infixl 7 .&
+infixl 5 .|, .^
+class BitOp a where
+	(.&), (.|), (.^) :: a -> a -> a
+
+instance (BitRepr a, BitOp a) => BitOp (QE a) where
+	(.&) = mkBin And
+	(.|) = mkBin Or
+	(.^) = mkBin Xor
 
 -------------------------------------------------------------------------------
 -- Defining the processes.
@@ -163,6 +221,7 @@ data RChan a = RChan ChanID
 
 data Action =
 		ANop
+	|	AFail	SizedExpr
 	|	AWrite	ChanID		SizedExpr
 	|	AAssign	SizedExpr	SizedExpr
 	|	AGroup	GroupKind	Action	Action
@@ -187,6 +246,8 @@ _addAction act = modify $ \p -> p { procActions = act : procActions p }
 data Process ins outs where
 	Process :: Proc -> Process ins outs
 
+deriving instance Show (Process ins outs)
+
 startProc :: String -> Proc
 startProc name = Proc {
 	  procName		= name
@@ -205,14 +266,27 @@ unique = do
 	modify $ \p -> p { procUnique = 1 + procUnique p }
 	liftM procUnique get
 
-class IOChans ins where
-	inventChans :: [String] -> ins
+_newTemp :: QE a -> ActionM (QE a)
+_newTemp (QE e) = do
+	i <- unique
+	return $ QE $ SE (seSize e) (EVar (VarID Nothing [i]))
+
+type family StringList ios
+type instance StringList Nil = Nil
+type instance StringList (a :. as) = String :. StringList as
+
+class NamesList a where toNamesList :: a -> [String]
+instance NamesList Nil where toNamesList Nil = []
+instance NamesList as => NamesList (String :. as) where toNamesList (n :. ns) = n : toNamesList ns
+
+class NamesList (StringList ins) => IOChans ins where
+	inventChans :: StringList ins -> ins
 
 instance IOChans Nil where
-	inventChans [] = Nil
+	inventChans Nil = Nil
 
 instance (BitRepr a, IOChans ins) => IOChans (RChan a :. ins) where
-	inventChans (n : ns) = r :. inventChans ns
+	inventChans (n :. ns) = r :. inventChans ns
 		where
 			r = RChan (ChanID size defaultClock n)
 			value :: RChan a -> a
@@ -221,7 +295,7 @@ instance (BitRepr a, IOChans ins) => IOChans (RChan a :. ins) where
 			size = reifySize (value r)
 
 instance (BitRepr a, IOChans outs) => IOChans (WChan a :. outs) where
-	inventChans (n : ns) = r :. inventChans ns
+	inventChans (n :. ns) = r :. inventChans ns
 		where
 			r = WChan (ChanID size defaultClock n)
 			value :: WChan a -> a
@@ -246,18 +320,38 @@ type family OUTS ins
 type instance OUTS Nil = Nil
 type instance OUTS (i :. is) = WChan i :. OUTS is
 
-process :: (IOChans (INS ins), IOChans (OUTS outs)) => String -> [String] -> [String] -> (INS ins -> OUTS outs -> ActionM ()) -> Process ins outs
+process :: (IOChans (INS ins), IOChans (OUTS outs)) => String -> StringList (INS ins) -> StringList (OUTS outs) -> (INS ins -> OUTS outs -> ActionM ()) -> Process ins outs
 process name insNames outsNames body = Process $ flip execState (startProc name) $ do
-	when (not $ null $ intersect insNames outsNames) $ error "inputs and outputs intersect."
-	when (length (nub insNames) /= length insNames) $ error "duplicate inputs names"
-	when (length (nub outsNames) /= length outsNames) $ error "duplicate outputs names"
+	let insNamesList = toNamesList insNames
+	    outsNamesList = toNamesList outsNames
+	when (not $ null $ intersect insNamesList outsNamesList) $ error "inputs and outputs intersect."
+	when (length (nub insNamesList) /= length insNamesList) $ error "duplicate inputs names"
+	when (length (nub outsNamesList) /= length outsNamesList) $ error "duplicate outputs names"
 	body (inventChans insNames) (inventChans outsNames)
 
 select :: BitRepr a => QE Bool -> QE a -> QE a -> QE a
 select (QE c) tqe@(QE t) (QE f) = QE (SE (qeValueSize tqe) $ ESel c t f)
 
-match :: Selectable r => QE e -> [(QE a, r)] -> r
-match e matches = error "match!!!"
+matchStat :: QE e -> [(QE a, ActionM ())] -> ActionM ()
+matchStat e [] = error "matchStat on empty match list."
+matchStat x@(QE e) matches = do
+	t <- _newTemp x
+	(t $= x) &&& (foldr1 (|||) $ map (matchAssigns t) matches)
+	where
+		matchAssigns (QE e) (QE match, comp) = do
+			(c,assigns) <- genCond e match
+			assigns &&& assert (QE c) &&& comp
+		genCond :: SizedExpr -> SizedExpr -> ActionM (SizedExpr, ActionM ())
+		genCond _ (SE _ EWild) = return (eTrue, _addAction ANop)
+		genCond e v@(SE _ (EVar vid)) = do
+			return (eTrue, _addAction $ AAssign v e)
+		genCond e c@(SE _ (EConst _)) = do
+			return (SE 1 $ EBin Equal e c, _addAction $ ANop)
+		genCond e c@(SE _ (ECat es)) = do
+			let subIndices = tail $ scanr (+) 0 $ map seSize es
+			(conds, assigns) <- liftM unzip $ forM (zip subIndices es) $ \(ofs, se) ->
+				genCond (SE (seSize se) (ESlice e ofs)) se
+			return (foldl1 (\a b -> SE 1 $ EBin And a b) conds, foldl1 (&&&) assigns)
 
 ($=) :: QE a -> QE a -> ActionM ()
 QE v $= QE e = case v of
@@ -269,7 +363,10 @@ def name = do
 	n <- unique
 	let r = QE (SE (qeValueSize r) (EVar (VarID (Just name) [n])))
 	return r
-
+	
+infixl 2 &&&
+infixl 1 |||
+infix 3 $=
 (&&&), (|||) :: ActionM () -> ActionM () -> ActionM ()
 a1 &&& a2 = _group SeqActions a1 a2
 a1 ||| a2 = _group ParActions a1 a2
@@ -293,12 +390,18 @@ _group kind a1 a2 = do
 	modify $ \p -> p { procActions = as }
 	_addAction $ AGroup kind left right
 
-write :: WChan a -> QE a -> ActionM ()
-write (WChan chanID) (QE e) = _addAction $ AWrite chanID e
+writeC :: WChan a -> QE a -> ActionM ()
+writeC (WChan chanID) (QE e) = _addAction $ AWrite chanID e
+
+readC :: BitRepr a => RChan a -> QE a
+readC (RChan cid) = pqMkQE $ ERead cid
 
 pqTrue, pqFalse :: QE Bool
-pqTrue = QE (SE 1 $ EConst 1)
-pqFalse = QE (SE 1 $ EConst 0)
+eFalse, eTrue :: SizedExpr
+eFalse = SE 1 $ EConst 0
+eTrue = SE 1 $ EConst 1
+pqTrue = QE eTrue
+pqFalse = QE eFalse
 
 on :: QE Bool -> ActionM () -> ActionM ()
 on (QE e) act = do
@@ -309,6 +412,9 @@ on (QE e) act = do
 	modify $ \p -> p { procActions = before }
 	_addAction $ AIf e after [ANop]
 
+assert :: QE Bool -> ActionM ()
+assert (QE cond) = _addAction $ AFail cond
+
 loop :: ActionM () -> ActionM ()
 loop actions = do
 	before <- liftM procActions get
@@ -318,17 +424,12 @@ loop actions = do
 	modify $ \p -> p { procActions = ALoop after : before }
 
 __ :: BitRepr a => QE a
-__ = mkQE EWild
+__ = pqMkQE EWild
 
-class Tuple a where
-	type TupleLifted a
-	pqTup :: a -> TupleLifted a
+class BitRepr b => Tuple a b | a -> b, b -> a where
+	pqTup :: a -> QE b
 
---instance (BitRepr a, BitRepr b, BitRepr (a,b)) => Tuple (QE a,QE b) where
---	type TupleLifted (QE a,QE b) = QE (a,b)
---	pqTup (QE a,QE b) = QE $ SE (sum $ map seSize [a,b]) $ ECat [a,b]
-
-(-->) :: Selectable r => QE a -> r -> (QE a, r)
+(-->) :: QE a -> r -> (QE a, r)
 qe --> r = (qe, r)
 
 $(liftM concat $ forM [2..4] $ \n -> let
@@ -336,22 +437,63 @@ $(liftM concat $ forM [2..4] $ \n -> let
 		tupleTy = foldl AppT (TupleT n) $ map VarT names
 		qeTupleTy = foldl AppT (TupleT n) $ map ((ConT ''QE `AppT`) . VarT) names
 		bitReprSizeFT ty = ConT ''BitReprSize `AppT` ty
-		bitReprSizes = map (\n -> ClassP ''BitRepr [VarT n]) names
+		bitReprs = map (\n -> ClassP ''BitRepr [VarT n]) names
 		plusFT a b = ConT ''Plus `AppT` a `AppT` b
-		bitReprI = InstanceD (ClassP ''Nat [bitReprSizeFT tupleTy] : bitReprSizes) (ConT ''BitRepr `AppT` tupleTy)
-			[TySynInstD ''BitReprSize [tupleTy] (foldl1 plusFT (map VarT names))]
-		tupleI = InstanceD (ClassP ''BitRepr [tupleTy] : bitReprSizes) (ConT ''Tuple `AppT` qeTupleTy) [pqTupD, tupleLiftedD]
+		sizeTE = foldl1 plusFT (map (bitReprSizeFT . VarT) names)
+		bitReprI = InstanceD (ClassP ''Nat [sizeTE] : bitReprs) (ConT ''BitRepr `AppT` tupleTy)
+			[TySynInstD ''BitReprSize [tupleTy] sizeTE]
+		tupleI = InstanceD (ClassP ''BitRepr [tupleTy] : bitReprs) (ConT ''Tuple `AppT` qeTupleTy `AppT` tupleTy) [pqTupD]
 		sizedExprE size e = ConE 'SE `AppE` size `AppE` e
 		seSizeE se = VarE 'seSize `AppE` se
-		tupleLiftedD = TySynInstD ''TupleLifted [qeTupleTy] (ConT ''QE `AppT` tupleTy)
 		pqTupD = FunD 'pqTup
 			[Clause
 				[TupP $ map (\n -> ConP 'QE [VarP n]) names]
 				(NormalB (ConE 'QE `AppE` (sizedExprE (VarE 'sum `AppE` ListE (map (seSizeE . VarE) names)) (ConE 'ECat `AppE` ListE (map (\n -> VarE n) names))))) []]
-	in return [bitReprI, tupleI]
+		tupleNF =
+			[ SigD fName (ForallT (map PlainTV names) (ClassP ''BitRepr [tupleTy] : bitReprs) $ ArrowT `AppT` qeTupleTy `AppT` (ConT ''QE `AppT` tupleTy))
+			, FunD fName
+				[Clause [] (NormalB $ VarE 'pqTup) []]
+			]
+			where
+				fName = mkName $ "pqTup"++show n
+	in return $ concat [[bitReprI, tupleI], tupleNF]
  )
 
 pqDefs :: Q [Dec] -> Q [Dec]
 pqDefs qdecs = do
 	decs <- qdecs
-	return decs
+	let r = decs ++ generatedDecs decs
+--	runIO $ print $ ppr r
+	return r
+	where
+		generatedDecs = concatMap genDecs
+		genDecs (DataD cxt tyN varBinds conses _)
+			| not (null cxt) = error "non-empty context of data declaration."
+			| Nothing <- convertedVars = error "only plain type variables are supported."
+			| Just names <- pureEnum = case vars of
+				[] -> enumBitRepr names : concat (zipWith enumExprs [0..] names)
+				_ -> phantomsArentSupported
+			| otherwise = error "only enums are supported right now."
+			where
+				phantomsArentSupported = error "Phantom parameters are not supported."
+				convertedVars = forM varBinds $ \vb -> case vb of
+					PlainTV v -> return v
+					_ -> Nothing
+				Just vars = convertedVars
+				pureEnum = forM conses $ \c -> case c of
+					NormalC n [] -> Just n
+					_ -> Nothing
+				bitReprT ty = ConT ''BitRepr `AppT` ty
+				dataTy = foldl AppT (ConT tyN) $ map VarT vars
+				qeTy ty = ConT ''QE `AppT` ty
+				toPeano 0 = ConT ''Z
+				toPeano n = ConT ''S `AppT` toPeano (n-1)
+				enumBitRepr names = InstanceD [] (bitReprT dataTy)
+					[ TySynInstD ''BitReprSize [dataTy] (toPeano $ if length names < 3 then length names -1 else length names)
+					]
+				enumExprs n conN = [SigD qeN (qeTy dataTy), FunD qeN [Clause [] (NormalB e) []]]
+					where
+						index = if length conses > 2 then shiftL 1 n else n
+						e = VarE 'pqMkQE `AppE` (ConE 'EConst `AppE` LitE (IntegerL $ fromIntegral index))
+						qeN = mkName $ "pq"++nameBase conN
+
