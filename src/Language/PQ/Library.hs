@@ -25,6 +25,7 @@ bufP :: BitRepr a => Process (a :. Nil) (a :. Nil)
 bufP = process "buf" ("input" :. Nil) ("output" :. Nil) $ \(input :. Nil) (output :. Nil) -> do
 	t <- def "temp"
 	hasValue <- def "hasValue"
+	hasValue $= pqFalse
 	loop $ do
 			on hasValue (writeC output t)
 		&&& 	((t $= readC input &&& hasValue $= pqTrue) ||| hasValue $= pqFalse)
