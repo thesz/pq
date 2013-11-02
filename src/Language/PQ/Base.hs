@@ -137,7 +137,7 @@ defaultClock = ClockInfo {
 data SizedExpr = SE { seSize :: Int, seExpr :: Expr }
 	deriving (Eq, Ord, Show)
 
-data VarID = VarID (Maybe String) [Int]
+data VarID = VarID [String] [Int]
 	deriving (Eq, Ord, Show)
 
 data Expr =
@@ -216,7 +216,7 @@ instance (BitRepr a, BitOp a) => BitOp (QE a) where
 -------------------------------------------------------------------------------
 -- Defining the processes.
 
-data ChanID = ChanID Int ClockInfo String
+data ChanID = ChanID Int ClockInfo [String]
 	deriving (Eq, Ord, Show)
 
 data WChan a = WChan ChanID
@@ -241,6 +241,8 @@ data GroupKind = SeqActions | ParActions
 data Proc = Proc {
 	  procName		:: String
 	, procUnique		:: Int
+	, procInputs		:: [ChanID]
+	, procOutputs		:: [ChanID]
 	, procSubProcs		:: [Proc]
 	, procActions		:: [Action]
 	}
@@ -258,6 +260,8 @@ startProc :: String -> Proc
 startProc name = Proc {
 	  procName		= name
 	, procUnique		= 0
+	, procInputs		= []
+	, procOutputs		= []
 	, procSubProcs		= []
 	, procActions		= []
 	}
@@ -275,7 +279,7 @@ unique = do
 _newTemp :: QE a -> ActionM (QE a)
 _newTemp (QE e) = do
 	i <- unique
-	return $ QE $ SE (seSize e) (EVar (VarID Nothing [i]))
+	return $ QE $ SE (seSize e) (EVar (VarID [] [i]))
 
 type family StringList ios
 type instance StringList Nil = Nil
@@ -285,35 +289,33 @@ class NamesList a where toNamesList :: a -> [String]
 instance NamesList Nil where toNamesList Nil = []
 instance NamesList as => NamesList (String :. as) where toNamesList (n :. ns) = n : toNamesList ns
 
-class NamesList (StringList ins) => IOChans ins where
-	inventChans :: StringList ins -> ins
+class NamesList (StringList cs) => IOChans cs where
+	inventChans :: StringList cs -> cs
+	chanList :: cs -> [ChanID]
 
 instance IOChans Nil where
 	inventChans Nil = Nil
+	chanList _ = []
 
 instance (BitRepr a, IOChans ins) => IOChans (RChan a :. ins) where
 	inventChans (n :. ns) = r :. inventChans ns
 		where
-			r = RChan (ChanID size defaultClock n)
+			r = RChan (ChanID size defaultClock [n])
 			value :: RChan a -> a
 			value = error "value!"
 
 			size = reifySize (value r)
+	chanList (RChan c :. cs) = c : chanList cs
 
 instance (BitRepr a, IOChans outs) => IOChans (WChan a :. outs) where
 	inventChans (n :. ns) = r :. inventChans ns
 		where
-			r = WChan (ChanID size defaultClock n)
+			r = WChan (ChanID size defaultClock [n])
 			value :: WChan a -> a
 			value = error "value!"
 
 			size = reifySize (value r)
-
-class Selectable e where
-	selectResult :: QE Bool -> e -> e -> e
-
-instance BitRepr t => Selectable (QE t) where
-	selectResult c x y = select c x y
+	chanList (WChan c :. cs) = c : chanList cs
 
 -------------------------------------------------------------------------------
 -- Combinators visible to users.
@@ -333,10 +335,23 @@ process name insNames outsNames body = Process $ flip execState (startProc name)
 	when (not $ null $ intersect insNamesList outsNamesList) $ error "inputs and outputs intersect."
 	when (length (nub insNamesList) /= length insNamesList) $ error "duplicate inputs names"
 	when (length (nub outsNamesList) /= length outsNamesList) $ error "duplicate outputs names"
-	body (inventChans insNames) (inventChans outsNames)
+	let ins = inventChans insNames
+	    outs = inventChans outsNames
+	modify $ \p -> p
+		{ procInputs = chanList ins
+		, procOutputs = chanList outs
+		}
+	body ins outs
+
+instantiate :: String -> Process ins outs -> ActionM (INS outs, OUTS ins)
+instantiate instanceName process = error "instantiate!"
 
 select :: BitRepr a => QE Bool -> QE a -> QE a -> QE a
 select (QE c) tqe@(QE t) (QE f) = QE (SE (qeValueSize tqe) $ ESel c t f)
+
+class Reclock c where reclockChan :: ClockInfo -> c -> ActionM ()
+instance Reclock (WChan a) where reclockChan ci (WChan cid) = error "reclock wchan!"
+instance Reclock (RChan a) where reclockChan ci (RChan cid) = error "reclock wchan!"
 
 matchStat :: QE e -> [(QE a, ActionM ())] -> ActionM ()
 matchStat e [] = error "matchStat on empty match list."
@@ -367,7 +382,7 @@ QE v $= QE e = case v of
 def :: BitRepr a => String -> ActionM (QE a)
 def name = do
 	n <- unique
-	let r = QE (SE (qeValueSize r) (EVar (VarID (Just name) [n])))
+	let r = QE (SE (qeValueSize r) (EVar (VarID [name] [n])))
 	return r
 	
 infixl 2 &&&
@@ -446,8 +461,16 @@ $(liftM concat $ forM [2..4] $ \n -> let
 		bitReprs = map (\n -> ClassP ''BitRepr [VarT n]) names
 		plusFT a b = ConT ''Plus `AppT` a `AppT` b
 		sizeTE = foldl1 plusFT (map (bitReprSizeFT . VarT) names)
+		encodeTuple = FunD 'encode [Clause [TupP $ map VarP names] (NormalB encodeE) []]
+			where
+				encodeE = VarE 'undefined
+		decodeTuple = FunD 'decode [Clause [VarP x] (NormalB decodeE) []]
+			where
+				x = mkName "x"
+				decodeE = VarE 'undefined
 		bitReprI = InstanceD (ClassP ''Nat [sizeTE] : bitReprs) (ConT ''BitRepr `AppT` tupleTy)
-			[TySynInstD ''BitReprSize [tupleTy] sizeTE]
+			$ TySynInstD ''BitReprSize [tupleTy] sizeTE
+			: encodeTuple : decodeTuple : []
 		tupleI = InstanceD (ClassP ''BitRepr [tupleTy] : bitReprs) (ConT ''Tuple `AppT` qeTupleTy `AppT` tupleTy) [pqTupD]
 		sizedExprE size e = ConE 'SE `AppE` size `AppE` e
 		seSizeE se = VarE 'seSize `AppE` se
@@ -517,4 +540,22 @@ pqDefs qdecs = do
 						index = if length conses > 2 then shiftL 1 n else n
 						e = VarE 'pqMkQE `AppE` (ConE 'EConst `AppE` LitE (IntegerL $ fromIntegral index))
 						qeN = mkName $ "pq"++nameBase conN
+
+-------------------------------------------------------------------------------
+-- Graph for code generation.
+
+newtype GIx = GIx Int
+	deriving (Eq, Ord, Show)
+
+-- |This graph expression is completely isomorphic to Expr above.
+-- Main difference is that instead of SizedExpr we use graph node indices.
+data GExpr =
+		GEConst	Integer
+	|	GEVar	VarID
+	|	GEBin	BinOp	GIx	GIx
+	|	GESel	GIx	GIx	GIx
+	|	GECat	[GIx]
+	|	GESlice	GIx	Int
+	|	GERead	ChanID
+	deriving (Eq, Ord, Show)
 
