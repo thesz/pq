@@ -83,6 +83,12 @@ instance BitRepr Bool where
 	encode = fromIntegral . fromEnum
 	decode = toEnum . fromIntegral . (.&. 1)
 
+instance BitRepr () where
+	type BitReprSize () = Z
+	safeValue = ()
+	encode = const 0
+	decode = const ()
+
 type Dbl a = Plus a a
 
 instance BitRepr Word8 where
@@ -488,9 +494,24 @@ pqDefs qdecs = do
 				qeTy ty = ConT ''QE `AppT` ty
 				toPeano 0 = ConT ''Z
 				toPeano n = ConT ''S `AppT` toPeano (n-1)
-				enumBitRepr names = InstanceD [] (bitReprT dataTy)
-					[ TySynInstD ''BitReprSize [dataTy] (toPeano $ if length names < 3 then length names -1 else length names)
+				enumEncodeDecode names =
+					[ FunD 'encode $ zipWith (\i n -> enc i n) [0..] names
+					, FunD 'decode $ [Clause [VarP x] (NormalB decodeCase) []]
 					]
+					where
+						decodeCase = CaseE (VarE 'mod `AppE` VarE x `AppE` LitE (IntegerL maxI)) (zipWith matches [0..] names)
+						matches i n = Match (LitP $ IntegerL (index i)) (NormalB $ ConE n) []
+						maxI = fromIntegral $ if bigEnum then namesLen else shiftL 1 namesLen
+						namesLen = length names
+						bigEnum = namesLen > 2
+						x = mkName "x"
+						index i
+							| bigEnum = shiftL 1 i
+							| otherwise = fromIntegral i
+						enc i name = Clause [ConP name []] (NormalB $ LitE $ IntegerL $ index i) []
+				enumBitRepr names = InstanceD [] (bitReprT dataTy)
+					$ TySynInstD ''BitReprSize [dataTy] (toPeano $ if length names < 3 then length names -1 else length names)
+					: enumEncodeDecode names
 				enumExprs n conN = [SigD qeN (qeTy dataTy), FunD qeN [Clause [] (NormalB e) []]]
 					where
 						index = if length conses > 2 then shiftL 1 n else n
