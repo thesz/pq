@@ -17,7 +17,7 @@ import Control.Monad.State
 
 import Data.Bits
 import Data.Int
-import Data.List (nub, intersect, isPrefixOf)
+import Data.List (nub, intersect, isPrefixOf, intersperse, intercalate)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import Data.Word
@@ -237,6 +237,12 @@ data Action =
 
 data GroupKind = SeqActions | ParActions
 	deriving (Eq, Ord, Show)
+
+data SubProc = SubProc {
+	  spProcess		:: Proc
+	, spIns			:: [ChanID]
+	, spOuts		:: [ChanID]
+	}
 
 data Proc = Proc {
 	  procName		:: String
@@ -565,6 +571,7 @@ data ExecPoint = ExecPoint {
 data GenS = GS {
 	  gsUnique		:: Int
 	, gsLanguage		:: Language
+	, gsDefaults		:: Map.Map VarID SizedExpr
 	, gsPoints		:: [ExecPoint]
 	, gsSeenProcesses	:: Map.Map Proc	String
 	, gsLines		:: [String]
@@ -598,6 +605,9 @@ genComment c = do
 		Verilog -> "// "++c
 		VHDL -> "-- "++c
 
+genChanName :: [String] -> String
+genChanName ns = intercalate "_" ns
+
 genHeader :: String -> Proc -> GenM ()
 genHeader n process = do
 	genNL
@@ -606,8 +616,10 @@ genHeader n process = do
 	case l of
 		Verilog -> do
 			genLine $ "module "++n
-			genNest $ forM_ (zip ("(" : repeat ",") clocksResets) $ \(c,i) -> genLine $ c++" input "++i
-			genLine ");"
+			genNest $ do
+				forM_ (zip ("(" : repeat ",") clocksResets) $ \(c,i) -> genLine $ c++" input "++i
+				forM_ ios $ \d -> genLine $ ", "++d
+				genLine ");"
 			genNL
 		VHDL -> error "header generation for VHDL."
 	where
@@ -616,6 +628,19 @@ genHeader n process = do
 		resetNames = nub $ map (resetName . clockReset) clocks
 		clocksResets = clockNames ++ resetNames
 		getClocks process = map (cidClockInfo) $ procInputs process ++ procOutputs process
+		inChans = procInputs process
+		outChans = procOutputs process
+		ios = concatMap (genChan "input" "output") inChans ++ concatMap (genChan "output" "input") outChans
+		genChan dirTo dirFrom (ChanID size _ name) =
+			dataIO ++ [declare dirTo 1 (name++["valid"]), declare dirFrom 1 (name++["ready"])]
+			where
+				declare dir size n = unwords [dir, sizeDecl, genChanName n]
+					where
+						sizeDecl
+							| size < 2 = ""
+							| otherwise = concat ["[", show (size-1),":0]"]
+				dataIO = if size < 1 then [] else [declare dirTo size name]
+
 
 genFooter :: String -> GenM ()
 genFooter n = do
@@ -623,6 +648,18 @@ genFooter n = do
 	case l of
 		VHDL -> genLine $ "end architecture implementation_arch;"
 		Verilog -> genLine $ "endmodule"
+
+genActionsExecPoints :: [Action] -> GenM ()
+genActionsExecPoints actions = assignmentsFirst actions
+	where
+		assignmentsFirst ((AAssign var expr) : actions) = do
+			case expr of
+				SE size (EConst c) -> error "constant!"
+				_ -> error $ "not a constant in assigning "++show var
+			assignmentsFirst actions
+		assignmentsFirst actions = go actions
+		go actions = mapM_ actionToExecPoints actions
+		actionToExecPoints _ = error "actionToExecPoints!"
 
 genProcess :: Proc -> GenM ()
 genProcess process = do
@@ -643,9 +680,81 @@ genProcess process = do
 			return goodName
 		gen = do
 			genNL
+			genComment $ "Instantiating sub processes."
+			forM_ (procSubProcs process) $ \sp -> error "generating subprocesses is not yet done!"
+			genNL
+			genComment $ "The body."
+			genInitDefs $ procActions process
+			genActionsExecPoints $ procActions process
 			genComment $ "Process "++procName process
+
+genGetRegisters :: [Action] -> GenM (Map.Map VarID Int, [Action], [Action])
+genGetRegisters actions = return (registers, actions, body)
+	where
+		(assigns, body) = span isAssign actions
+		isAssign (AAssign _ _) = True
+		isAssign _ = False
+		registers = findRegisters body
+		findRegisters actions = Map.unions $ map snd $ map findFirst actions
+		findFirst :: Action -> (Map.Map VarID Int, Map.Map VarID Int)
+		findFirst a = case a of
+			ANop -> (Map.empty, Map.empty)
+			AFail se -> (Map.empty, genSizedExprVars se)
+			AWrite _ se -> (Map.empty, genSizedExprVars se)
+			AAssign	v se -> (genSizedExprVars v, genSizedExprVars se)
+			AGroup SeqActions a b -> (Map.union defA defB, Map.union usedA (Map.difference usedB defA))
+				where
+					(defA, usedA) = findFirst a
+					(defB, usedB) = findFirst b
+			AGroup ParActions a b -> (Map.intersection usedA usedB, Map.union usedA usedB)
+				where
+					(defA, usedA) = findFirst a
+					(defB, usedB) = findFirst b
+			AIf se as1 as2 -> (Map.empty, Map.unions [genSizedExprVars se, findRegisters as1, findRegisters as2])
+			ALoop actions -> (Map.empty, findRegisters actions)
+
+genInitDefs :: [Action] -> GenM ()
+genInitDefs actions = do
+	(registers, _, _) <- genGetRegisters actions
+	modify $ \gs -> gs { gsDefaults = Map.map (\s -> SE s (EConst 0)) registers }
+
+
+genUnionVars :: [Map.Map VarID Int] -> Map.Map VarID Int
+genUnionVars varSets = foldr (Map.unionWithKey checkDups) Map.empty varSets
+	where
+		checkDups vid sz1 sz2
+			| sz1 == sz2 = sz1
+			| otherwise = error $ show vid++" has two different sizes "++show (sz1, sz2)
+
+genExprVars :: Expr -> Map.Map VarID Int
+genExprVars e = case e of
+	EConst _ -> Map.empty
+	EBin _ a b -> genUnionVars $ map genSizedExprVars [a,b]
+	ESel c t e -> genUnionVars $ map genSizedExprVars [c,t,e]
+	ECat ses -> genUnionVars $ map genSizedExprVars ses
+	ESlice e _ -> genSizedExprVars e
+	ERead _ -> Map.empty
+	EWild -> Map.empty
+
+genSizedExprVars :: SizedExpr -> Map.Map VarID Int
+genSizedExprVars (SE size (EVar varID)) = Map.singleton varID size
+genSizedExprVars se = genExprVars $ seExpr se
+
+genGetActionsVars :: [Action] -> Map.Map VarID Int
+genGetActionsVars actions = genUnionVars $ map actionVars actions
+	where
+		actionVars act = case act of
+			ANop -> Map.empty
+			AFail se -> genSizedExprVars  se
+			AWrite	_ e -> genSizedExprVars e
+			AAssign a b -> genUnionVars $ map genSizedExprVars [a,b]
+			AGroup _ a b -> genUnionVars $ map actionVars [a,b]
+			AIf e a b -> genUnionVars $ genSizedExprVars e : concatMap (map actionVars) [a,b]
+			ALoop as -> genUnionVars $ map actionVars as
+
+
 generate :: Language -> Process ins outs -> String
-generate lang (Process process) = flip evalState (GS 0 lang [] Map.empty [] "") $ do
+generate lang (Process process) = flip evalState (GS 0 lang Map.empty [] Map.empty [] "") $ do
 	genComment $ "Generating from top-level "++show (procName process)
 	genProcess process
 	liftM (unlines . reverse . gsLines) get
