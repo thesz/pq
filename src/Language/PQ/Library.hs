@@ -91,3 +91,4 @@ foldP suffix f a0 = process ("fold_"++suffix) ("input" :. Nil) ("output" :. Nil)
 			]
 
 t = foldP "qq" (.+) (constant 10 :: QE Word8)
+g = putStrLn $ generate Verilog t

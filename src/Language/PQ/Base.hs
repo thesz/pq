@@ -461,9 +461,18 @@ $(liftM concat $ forM [2..4] $ \n -> let
 		bitReprs = map (\n -> ClassP ''BitRepr [VarT n]) names
 		plusFT a b = ConT ''Plus `AppT` a `AppT` b
 		sizeTE = foldl1 plusFT (map (bitReprSizeFT . VarT) names)
-		encodeTuple = FunD 'encode [Clause [TupP $ map VarP names] (NormalB encodeE) []]
+		sizeN i = mkName $ "size"++show i
+		shiftN i = mkName $ "shift"++show i
+		encodeTuple = FunD 'encode [Clause [TupP $ map VarP names] (NormalB encodeE) (sizes ++ shifts)]
 			where
-				encodeE = VarE 'undefined
+				encodeE = foldl1 (\a b -> InfixE (Just a) (VarE $ mkName ".|.") (Just b)) $
+					zipWith (\a s -> VarE 'shiftL `AppE` (VarE 'encode `AppE` VarE a) `AppE` VarE (shiftN s))
+						names [1..]
+				sizes = zipWith (\a s -> ValD (VarP s) (NormalB $ VarE 'reifySize `AppE` VarE a) []) names (map sizeN [1..n])
+				shifts = map shift [1..n]
+				shift i
+					| i >= n = ValD (VarP (shiftN i)) (NormalB $ LitE $ IntegerL 0) []
+					| otherwise = ValD (VarP (shiftN i)) (NormalB $ InfixE (Just $ VarE $ sizeN (i+1)) (VarE $ mkName "+") (Just $ VarE (shiftN (i+1)))) []
 		decodeTuple = FunD 'decode [Clause [VarP x] (NormalB decodeE) []]
 			where
 				x = mkName "x"
@@ -542,20 +551,71 @@ pqDefs qdecs = do
 						qeN = mkName $ "pq"++nameBase conN
 
 -------------------------------------------------------------------------------
--- Graph for code generation.
+-- Transforming process AST into AST for code generation.
 
-newtype GIx = GIx Int
+data Language = Verilog | VHDL
 	deriving (Eq, Ord, Show)
 
--- |This graph expression is completely isomorphic to Expr above.
--- Main difference is that instead of SizedExpr we use graph node indices.
-data GExpr =
-		GEConst	Integer
-	|	GEVar	VarID
-	|	GEBin	BinOp	GIx	GIx
-	|	GESel	GIx	GIx	GIx
-	|	GECat	[GIx]
-	|	GESlice	GIx	Int
-	|	GERead	ChanID
+data ExecPoint = ExecPoint {
+	  epLabel		:: VarID
+	, epAssignments		:: [(VarID, SizedExpr)]
+	}
 	deriving (Eq, Ord, Show)
 
+data GenS = GS {
+	  gsUnique		:: Int
+	, gsLanguage		:: Language
+	, gsPoints		:: [ExecPoint]
+	, gsSeenProcesses	:: Map.Map Proc	String
+	, gsLines		:: [String]
+	, gsNest		:: String
+	}
+	deriving (Eq, Ord, Show)
+
+type GenM a = State GenS a
+
+genLine :: String -> GenM ()
+genLine s = do
+	modify $ \gs -> gs {
+		  gsLines = (if null s then "" else (gsNest gs ++ s)) : gsLines gs
+		}
+
+genNL :: GenM ()
+genNL = modify $ \gs -> gs { gsLines = "" : gsLines gs }
+
+genComment :: String -> GenM ()
+genComment c = do
+	l <- liftM gsLanguage get
+	genLine $ case l of
+		Verilog -> "// "++c
+		VHDL -> "-- "++c
+
+genHeader :: String -> Proc -> GenM ()
+genHeader n process = do
+	genNL
+	genComment $ "header for module "++n++" of process "++procName process
+
+genProcess :: Proc -> GenM ()
+genProcess process = do
+	n <- liftM (Map.lookup process . gsSeenProcesses) get
+	case n of
+		Nothing -> do
+			n <- inventName
+			genHeader n process
+			gen
+		Just _ -> return ()
+	where
+		inventName = do
+			names <- liftM (Set.fromList . Map.elems . gsSeenProcesses) get
+			let goodName = head $ filter (\n -> not $ Set.member n names) $ procName process
+				: map (\i -> procName process ++"_"++show i) [1..]
+			modify $ \gs -> gs { gsSeenProcesses = Map.insert process goodName $ gsSeenProcesses gs }
+			return goodName
+		gen = do
+			genNL
+			genComment $ "Process "++procName process
+generate :: Language -> Process ins outs -> String
+generate lang (Process process) = flip evalState (GS 0 lang [] Map.empty [] "") $ do
+	genComment $ "Generating from top-level "++show (procName process)
+	genProcess process
+	liftM (unlines . reverse . gsLines) get
