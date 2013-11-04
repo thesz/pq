@@ -216,7 +216,7 @@ instance (BitRepr a, BitOp a) => BitOp (QE a) where
 -------------------------------------------------------------------------------
 -- Defining the processes.
 
-data ChanID = ChanID Int ClockInfo [String]
+data ChanID = ChanID { cidSize :: Int, cidClockInfo :: ClockInfo, cidName :: [String] }
 	deriving (Eq, Ord, Show)
 
 data WChan a = WChan ChanID
@@ -583,6 +583,14 @@ genLine s = do
 genNL :: GenM ()
 genNL = modify $ \gs -> gs { gsLines = "" : gsLines gs }
 
+genNest :: GenM a -> GenM a
+genNest a = do
+	old <- liftM gsNest get
+	modify $ \gs -> gs { gsNest = "    "++gsNest gs }
+	x <- a
+	modify $ \gs -> gs { gsNest = old }
+	return x
+
 genComment :: String -> GenM ()
 genComment c = do
 	l <- liftM gsLanguage get
@@ -594,6 +602,27 @@ genHeader :: String -> Proc -> GenM ()
 genHeader n process = do
 	genNL
 	genComment $ "header for module "++n++" of process "++procName process
+	l <- liftM gsLanguage get
+	case l of
+		Verilog -> do
+			genLine $ "module "++n
+			genNest $ forM_ (zip ("(" : repeat ",") clocksResets) $ \(c,i) -> genLine $ c++" input "++i
+			genLine ");"
+			genNL
+		VHDL -> error "header generation for VHDL."
+	where
+		clocks = getClocks process
+		clockNames = nub $ map clockName clocks
+		resetNames = nub $ map (resetName . clockReset) clocks
+		clocksResets = clockNames ++ resetNames
+		getClocks process = map (cidClockInfo) $ procInputs process ++ procOutputs process
+
+genFooter :: String -> GenM ()
+genFooter n = do
+	l <- liftM gsLanguage get
+	case l of
+		VHDL -> genLine $ "end architecture implementation_arch;"
+		Verilog -> genLine $ "endmodule"
 
 genProcess :: Proc -> GenM ()
 genProcess process = do
@@ -603,6 +632,7 @@ genProcess process = do
 			n <- inventName
 			genHeader n process
 			gen
+			genFooter n
 		Just _ -> return ()
 	where
 		inventName = do
