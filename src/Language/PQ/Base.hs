@@ -24,6 +24,8 @@ import Data.Word
 import Language.Haskell.TH
 import qualified Language.Haskell.TH as TH
 
+import Debug.Trace
+
 -------------------------------------------------------------------------------
 -- HList stuff.
 
@@ -243,13 +245,14 @@ data SubProc = SubProc {
 	, spIns			:: [ChanID]
 	, spOuts		:: [ChanID]
 	}
+	deriving (Eq, Ord, Show)
 
 data Proc = Proc {
 	  procName		:: String
 	, procUnique		:: Int
 	, procInputs		:: [ChanID]
 	, procOutputs		:: [ChanID]
-	, procSubProcs		:: [Proc]
+	, procSubProcs		:: [SubProc]
 	, procActions		:: [Action]
 	}
 	deriving (Eq, Ord, Show)
@@ -277,10 +280,18 @@ type ActionM a = State Proc a
 internal :: String -> a
 internal s = error $ "internal error: "++s
 
-unique :: ActionM Int
-unique = do
-	modify $ \p -> p { procUnique = 1 + procUnique p }
-	liftM procUnique get
+class Unique m where
+	unique :: m Int
+
+instance Unique (State Proc) where
+	unique = do
+		modify $ \p -> p { procUnique = 1 + procUnique p }
+		liftM procUnique get
+
+newVarID :: (Monad m, Unique m) => [String] -> m VarID
+newVarID names = do
+	x <- unique
+	return $ VarID names [x]
 
 _newTemp :: QE a -> ActionM (QE a)
 _newTemp (QE e) = do
@@ -348,6 +359,7 @@ process name insNames outsNames body = Process $ flip execState (startProc name)
 		, procOutputs = chanList outs
 		}
 	body ins outs
+	modify $ \p -> p { procActions = reverse $ procActions p }
 
 instantiate :: String -> Process ins outs -> ActionM (INS outs, OUTS ins)
 instantiate instanceName process = error "instantiate!"
@@ -387,8 +399,8 @@ QE v $= QE e = case v of
 
 def :: BitRepr a => String -> ActionM (QE a)
 def name = do
-	n <- unique
-	let r = QE (SE (qeValueSize r) (EVar (VarID [name] [n])))
+	v <- newVarID [name]
+	let r = QE (SE (qeValueSize r) (EVar v))
 	return r
 	
 infixl 2 &&&
@@ -650,16 +662,18 @@ genFooter n = do
 		Verilog -> genLine $ "endmodule"
 
 genActionsExecPoints :: [Action] -> GenM ()
-genActionsExecPoints actions = assignmentsFirst actions
+genActionsExecPoints actions = do
+	(registers, assignments, body) <- genGetRegisters actions
+	mapM_ assignmentsFirst assignments
+	trace ("body "++unlines (map show body)) $ mapM_ convertToExecPoint body
 	where
-		assignmentsFirst ((AAssign var expr) : actions) = do
+		assignmentsFirst (AAssign var expr) = do
 			case expr of
 				SE size (EConst c) -> error "constant!"
-				_ -> error $ "not a constant in assigning "++show var
-			assignmentsFirst actions
-		assignmentsFirst actions = go actions
-		go actions = mapM_ actionToExecPoints actions
-		actionToExecPoints _ = error "actionToExecPoints!"
+				_ -> internal $ "not a constant in assigning "++show var
+		convertToExecPoint (ALoop actions) = error "convertToExecPoint!"
+		convertToExecPoint a = error $ "convertToExecPoint "++show a++"!"
+		
 
 genProcess :: Proc -> GenM ()
 genProcess process = do
