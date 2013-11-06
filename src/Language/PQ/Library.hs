@@ -90,5 +90,7 @@ foldP suffix f a0 = process ("fold_"++suffix) ("in_data" :. Nil) ("out_data" :. 
 			, pqTup (__, __, x) --> (t $= f t x)
 			]
 
-t = foldP "qq" (.+) (constant 10 :: QE Word8)
+t =
+	idP :: Process (Word8 :. Nil) (Word8 :. Nil)
+	--foldP "qq" (.+) (constant 10 :: QE Word8)
 g = putStrLn $ generate Verilog t

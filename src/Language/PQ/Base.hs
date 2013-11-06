@@ -23,6 +23,7 @@ import qualified Data.Set as Set
 import Data.Word
 import Language.Haskell.TH
 import qualified Language.Haskell.TH as TH
+import Text.Printf
 
 import Debug.Trace
 
@@ -146,6 +147,7 @@ data Expr =
 		EConst	Integer
 	|	EVar	VarID
 	|	EBin	BinOp		SizedExpr	SizedExpr
+	|	EUn	UnOp		SizedExpr
 	|	ESel	SizedExpr	SizedExpr	SizedExpr
 	|	ECat	[SizedExpr]
 	|	ESlice	SizedExpr	Int
@@ -154,6 +156,9 @@ data Expr =
 	deriving (Eq, Ord, Show)
 
 data BinOp = Plus | Minus | Mul | Div | Mod | And | Or | Xor | Equal | NEqual | LessThan | GreaterThan | LessEqual | GreaterEqual
+	deriving (Eq, Ord, Show)
+
+data UnOp = Negate | Not
 	deriving (Eq, Ord, Show)
 
 data QE a where
@@ -577,11 +582,13 @@ data Language = Verilog | VHDL
 data ExecPoint = ExecPoint {
 	  epLabel		:: VarID
 	, epAssignments		:: [(VarID, SizedExpr)]
+	, epControlFlow		:: ([(SizedExpr, VarID)], VarID)
 	}
 	deriving (Eq, Ord, Show)
 
 data GenS = GS {
 	  gsUnique		:: Int
+	, gsLabelI		:: Int
 	, gsLanguage		:: Language
 	, gsDefaults		:: Map.Map VarID SizedExpr
 	, gsPoints		:: [ExecPoint]
@@ -591,7 +598,24 @@ data GenS = GS {
 	}
 	deriving (Eq, Ord, Show)
 
+startGenS :: Language -> GenS
+startGenS l = GS {
+	  gsUnique		= 0
+	, gsLabelI		= 0
+	, gsLanguage		= l
+	, gsDefaults		= Map.empty
+	, gsPoints		= []
+	, gsSeenProcesses	= Map.empty
+	, gsLines		= []
+	, gsNest		= ""
+	}
+
 type GenM a = State GenS a
+
+instance Unique (State GenS) where
+	unique = do
+		modify $ \gs -> gs { gsUnique = gsUnique gs + 1 }
+		liftM gsUnique get
 
 genLine :: String -> GenM ()
 genLine s = do
@@ -610,26 +634,36 @@ genNest a = do
 	modify $ \gs -> gs { gsNest = old }
 	return x
 
+genLanguage :: GenM Language
+genLanguage = liftM gsLanguage get
+
 genComment :: String -> GenM ()
 genComment c = do
-	l <- liftM gsLanguage get
+	l <- genLanguage
 	genLine $ case l of
 		Verilog -> "// "++c
 		VHDL -> "-- "++c
 
-genChanName :: [String] -> String
-genChanName ns = intercalate "_" ns
+genChanName :: ChanID -> String
+genChanName (ChanID _ _ ns) = intercalate "_" ns
+
+genChanReady, genChanValid :: ChanID -> VarID
+genChanReady (ChanID _ _ names) = VarID (names ++ ["ready"]) []
+genChanValid (ChanID _ _ names) = VarID (names ++ ["valid"]) []
+
+genVarName :: VarID -> String
+genVarName (VarID names indices) = intercalate "_" $ names ++ map show indices
 
 genHeader :: String -> Proc -> GenM ()
 genHeader n process = do
 	genNL
 	genComment $ "header for module "++n++" of process "++procName process
-	l <- liftM gsLanguage get
+	l <- genLanguage
 	case l of
 		Verilog -> do
 			genLine $ "module "++n
 			genNest $ do
-				forM_ (zip ("(" : repeat ",") clocksResets) $ \(c,i) -> genLine $ c++" input "++i
+				forM_ (zip ("(" : repeat ",") clocksResets) $ \(c,i) -> genLine $ c++" input "++replicate 14 ' '++i
 				forM_ ios $ \d -> genLine $ ", "++d
 				genLine ");"
 			genNL
@@ -642,38 +676,179 @@ genHeader n process = do
 		getClocks process = map (cidClockInfo) $ procInputs process ++ procOutputs process
 		inChans = procInputs process
 		outChans = procOutputs process
-		ios = concatMap (genChan "input" "output") inChans ++ concatMap (genChan "output" "input") outChans
-		genChan dirTo dirFrom (ChanID size _ name) =
-			dataIO ++ [declare dirTo 1 (name++["valid"]), declare dirFrom 1 (name++["ready"])]
+		ios = concatMap (genChan "input " "output") inChans ++ concatMap (genChan "output" "input ") outChans
+		genChan dirTo dirFrom cid@(ChanID size _ name) =
+			dataIO ++ [declare dirTo 1 genChanValid, declare dirFrom 1 genChanReady]
 			where
-				declare dir size n = unwords [dir, sizeDecl, genChanName n]
+				declare dir size f = unwords [dir, sizeDecl, genVarName $ f cid]
 					where
 						sizeDecl
-							| size < 2 = ""
-							| otherwise = concat ["[", show (size-1),":0]"]
-				dataIO = if size < 1 then [] else [declare dirTo size name]
+							| size < 2 = replicate 12 ' '
+							| otherwise = take 12 $ concat ["[", show (size-1),":0]"]++repeat ' '
+				dataIO = if size < 1 then [] else [declare dirTo size $ \(ChanID _ _ names) -> VarID names []]
 
 
 genFooter :: String -> GenM ()
 genFooter n = do
-	l <- liftM gsLanguage get
+	l <- genLanguage
 	case l of
 		VHDL -> genLine $ "end architecture implementation_arch;"
 		Verilog -> genLine $ "endmodule"
 
+genExecLabel :: Int -> VarID
+genExecLabel i = VarID ["pq_label"] [i]
+
+genNextLabel :: GenM VarID
+genNextLabel = liftM (genExecLabel . (+1) . gsLabelI) get
+
+genCurrentLabel :: GenM VarID
+genCurrentLabel = liftM (genExecLabel . gsLabelI) get
+
+genChangeLabel :: VarID -> VarID -> GenM ()
+genChangeLabel origL toL = modify $ \gs -> gs {
+	  gsPoints = map changeL $ gsPoints gs
+	}
+	where
+		changeL (ExecPoint label assignments (condChanges, elseChange)) =
+			ExecPoint label assignments (map condChange condChanges, change elseChange)
+		condChange (e,l) = (e,change l)
+		change l
+			| l == origL = toL
+			| otherwise = l
+
 genActionsExecPoints :: [Action] -> GenM ()
 genActionsExecPoints actions = do
 	(registers, assignments, body) <- genGetRegisters actions
-	mapM_ assignmentsFirst assignments
-	trace ("body "++unlines (map show body)) $ mapM_ convertToExecPoint body
+	trace ("asgns "++unlines (map show assignments)) mapM_ assignmentsFirst assignments
+	trace ("body "++unlines (map show body)) $ mapM_ addConvert body
+	modify $ \gs -> gs { gsPoints = reverse $ gsPoints gs }
 	where
-		assignmentsFirst (AAssign var expr) = do
+		assignmentsFirst (AAssign (SE _ (EVar var)) expr) = do
 			case expr of
-				SE size (EConst c) -> error "constant!"
+				SE size (EConst c) -> modify $ \gs -> gs { gsDefaults = Map.insert var expr $ gsDefaults gs}
 				_ -> internal $ "not a constant in assigning "++show var
-		convertToExecPoint (ALoop actions) = error "convertToExecPoint!"
-		convertToExecPoint a = error $ "convertToExecPoint "++show a++"!"
-		
+		assignmentsFirst a = internal $ show a ++ " in assignmentsFirst."
+		addConvert action = do
+			this <- genCurrentLabel
+			next <- genNextLabel
+			let execPoint = ExecPoint this [] ([], next)
+			modify $ \gs -> gs { gsPoints = execPoint : gsPoints gs }
+			convertToExecPoint action
+		-- top-level conversion function.
+		convertToExecPoint (ALoop actions) = do
+			begin <- genCurrentLabel
+			mapM_ addConvert actions
+			exit <- genCurrentLabel
+			genChangeLabel exit begin
+		convertToExecPoint a@(AGroup _ _ _) = do
+			start <- genCurrentLabel
+			convertToExecPoint' start a
+			return ()
+		convertToExecPoint a = internal $ "convertToExecPoint top "++show a++"!"
+
+		onTopEP changeEP = modify $ \gs -> gs { gsPoints = case gsPoints gs of
+				ep : eps -> changeEP ep : eps
+				eps -> eps
+			}
+
+		addAssign var sizedExpr = do
+			onTopEP $ \ep -> ep { epAssignments = epAssignments ep ++ [(var, sizedExpr)] }
+
+		succeedVar = newVarID ["pq","succeed"]
+
+		-- conversion function of internals of exec point.
+		convertToExecPoint' started (AGroup SeqActions a b) = do
+			succeed' <- convertToExecPoint' started a
+			convertToExecPoint' succeed' b
+		convertToExecPoint' started (AGroup ParActions a b) = do
+			succeedA <- convertToExecPoint' started a
+			startedB <- succeedVar
+			addAssign startedB (SE 1 $ EBin And (SE 1 $ EVar started) (SE 1 $ EUn Not $ (SE 1 $ EVar succeedA)))
+			succeedB <- convertToExecPoint' startedB b
+			succeedAny <- succeedVar
+			addAssign succeedAny (SE 1 $ EBin Or (SE 1 $ EVar succeedA) (SE 1 $ EVar succeedB))
+			return succeedAny
+		convertToExecPoint' succeed (AAssign (SE _ (EVar v)) sizedE) = do
+			addAssign v sizedE
+			return succeed
+		convertToExecPoint' succeed ANop = return succeed
+		convertToExecPoint' succeed (AWrite chan expr) = do
+			return succeed
+		convertToExecPoint' succeed (AFail cond) = do
+			v <- succeedVar
+			addAssign v (SE 1 $ EBin And (SE 1 $ EVar succeed) cond)
+			return succeed
+		convertToExecPoint' succeed a = internal $ "conversion to exec point of "++show a
+
+genDumpExecPoints :: GenM ()
+genDumpExecPoints = do
+	l <- genLanguage
+	eps <- liftM gsPoints get
+	genComment "Declarations."
+	forM_ (nub $ concatMap epsDecls eps) $ declare l
+	genComment "State changing assignments as combinational logic."
+	forM_ (concatMap epAssignments eps) $ assign l
+	return ()
+	where
+		assign Verilog (var, expr) = 
+			genLine $ unwords ["assign",genVarName var, "=", vlogExpr expr]++";"
+		assign VHDL (var, expr) =
+			genLine $ unwords [genVarName var, "<=", vhdlExpr expr]++";"
+		vhdlExpr e = internal $ "vhdl expr!"
+		vlogExpr (SE size e) = case e of
+			EConst c -> printf "%d'h%x" size c
+			EVar v -> genVarName v
+			EBin op a b -> bin $ case op of
+				Plus -> "+"
+				Minus -> "-"
+				Mul -> "*"
+				Div -> "/"
+				Mod -> "%"
+				And -> "&"
+				Or -> "|"
+				Xor -> "^"
+				Equal -> "=="
+				NEqual -> "!="
+				LessThan -> "<"
+				GreaterThan -> ">"
+				LessEqual -> "<="
+				GreaterEqual -> ">="
+				where
+					bin s = unwords [as, s, bs]
+					as = vlogExpr a
+					bs = vlogExpr b
+			EUn op a -> (++vlogExpr a) $ case op of
+				Negate -> "-"
+				Not -> "~"
+			ESel a b c -> unwords [vlogExpr a, "?", vlogExpr b, ":", vlogExpr c]
+			ECat es -> concat ["{",intercalate ", " (map vlogExpr es), "}"];
+			ESlice e ofs -> concat [vlogExpr e, "[",show (ofs+size-1),":", show ofs,"]"]
+			ERead c -> genChanName c
+			EWild -> ""
+		declare Verilog (size, var) = do
+			genLine $ unwords ["wire", sizeDecl, genVarName var]++";"
+			where
+				sizeDecl
+					| size < 2 = ""
+					| otherwise = concat ["[",show (size-1),":0]"]
+		declare VHDL (size, var) = do
+			genLine $ unwords ["signal",genVarName var,":",sizeDecl]++";"
+			where
+				sizeDecl
+					| size < 2 = "bit"
+					| otherwise = concat ["unsigned(", show (size-1)," downto 0)"]
+		epsDecls = concatMap asgnDecls . epAssignments
+		asgnDecls (var, e@(SE size _)) = [(size, var)] ++ exprDecls e
+		exprDecls (SE size e) = case e of
+			EConst	_ -> []
+			EVar var -> [(size, var)]
+			EBin _ a b -> exprDecls a ++ exprDecls b
+			EUn _ a -> exprDecls a
+			ESel a b c -> concatMap exprDecls [a,b,c]
+			ECat es -> concatMap exprDecls es
+			ESlice e _ -> exprDecls e
+			ERead _ -> []
+			EWild -> []
 
 genProcess :: Proc -> GenM ()
 genProcess process = do
@@ -700,10 +875,11 @@ genProcess process = do
 			genComment $ "The body."
 			genInitDefs $ procActions process
 			genActionsExecPoints $ procActions process
+			genDumpExecPoints
 			genComment $ "Process "++procName process
 
 genGetRegisters :: [Action] -> GenM (Map.Map VarID Int, [Action], [Action])
-genGetRegisters actions = return (registers, actions, body)
+genGetRegisters actions = return (registers, assigns, body)
 	where
 		(assigns, body) = span isAssign actions
 		isAssign (AAssign _ _) = True
@@ -768,7 +944,7 @@ genGetActionsVars actions = genUnionVars $ map actionVars actions
 
 
 generate :: Language -> Process ins outs -> String
-generate lang (Process process) = flip evalState (GS 0 lang Map.empty [] Map.empty [] "") $ do
+generate lang (Process process) = flip evalState (startGenS lang) $ do
 	genComment $ "Generating from top-level "++show (procName process)
 	genProcess process
 	liftM (unlines . reverse . gsLines) get
