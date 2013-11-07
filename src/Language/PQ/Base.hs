@@ -17,8 +17,9 @@ import Control.Monad.State
 
 import Data.Bits
 import Data.Int
-import Data.List (nub, intersect, isPrefixOf, intersperse, intercalate)
+import Data.List (nub, nubBy, intersect, isPrefixOf, intersperse, intercalate)
 import qualified Data.Map as Map
+import Data.Maybe (catMaybes)
 import qualified Data.Set as Set
 import Data.Word
 import Language.Haskell.TH
@@ -220,6 +221,10 @@ instance (BitRepr a, BitOp a) => BitOp (QE a) where
 	(.|) = mkBin Or
 	(.^) = mkBin Xor
 
+instance BitOp SizedExpr where
+	 a .& b = SE 1 $ EBin And a b
+	 a .| b = SE 1 $ EBin Or a b
+	 a .^ b = SE 1 $ EBin Xor a b
 -------------------------------------------------------------------------------
 -- Defining the processes.
 
@@ -395,7 +400,7 @@ matchStat x@(QE e) matches = do
 			let subIndices = tail $ scanr (+) 0 $ map seSize es
 			(conds, assigns) <- liftM unzip $ forM (zip subIndices es) $ \(ofs, se) ->
 				genCond (SE (seSize se) (ESlice e ofs)) se
-			return (foldl1 (\a b -> SE 1 $ EBin And a b) conds, foldl1 (&&&) assigns)
+			return (foldl1 (.&) conds, foldl1 (&&&) assigns)
 
 ($=) :: QE a -> QE a -> ActionM ()
 QE v $= QE e = case v of
@@ -592,6 +597,7 @@ data GenS = GS {
 	, gsLanguage		:: Language
 	, gsDefaults		:: Map.Map VarID SizedExpr
 	, gsPoints		:: [ExecPoint]
+	, gsClock		:: ClockInfo
 	, gsSeenProcesses	:: Map.Map Proc	String
 	, gsLines		:: [String]
 	, gsNest		:: String
@@ -605,6 +611,7 @@ startGenS l = GS {
 	, gsLanguage		= l
 	, gsDefaults		= Map.empty
 	, gsPoints		= []
+	, gsClock		= internal "gsClock wasn't set."
 	, gsSeenProcesses	= Map.empty
 	, gsLines		= []
 	, gsNest		= ""
@@ -647,9 +654,11 @@ genComment c = do
 genChanName :: ChanID -> String
 genChanName (ChanID _ _ ns) = intercalate "_" ns
 
-genChanReady, genChanValid :: ChanID -> VarID
+genChanReady, genChanValid, genChanData :: ChanID -> VarID
 genChanReady (ChanID _ _ names) = VarID (names ++ ["ready"]) []
 genChanValid (ChanID _ _ names) = VarID (names ++ ["valid"]) []
+genChanData (ChanID _ _ names) = VarID (names) []
+
 
 genVarName :: VarID -> String
 genVarName (VarID names indices) = intercalate "_" $ names ++ map show indices
@@ -719,15 +728,42 @@ genChangeLabel origL toL = modify $ \gs -> gs {
 genActionsExecPoints :: [Action] -> GenM ()
 genActionsExecPoints actions = do
 	(registers, assignments, body) <- genGetRegisters actions
-	trace ("asgns "++unlines (map show assignments)) mapM_ assignmentsFirst assignments
-	trace ("body "++unlines (map show body)) $ mapM_ addConvert body
+	mapM_ assignmentsFirst assignments
+	mapM_ addConvert body
 	modify $ \gs -> gs { gsPoints = reverse $ gsPoints gs }
+	modify $ \gs -> gs { gsClock = actionsClock}
 	where
+		actionsClock = case nubBy (\a b -> cidClockInfo a == cidClockInfo b) $ concatMap actionClock actions of
+			[] -> error $ "No channel operations detected, cannot determine what clock to use."
+			[c] -> cidClockInfo c
+			cs -> error $ "Port operations with different clocks: "++show cs
+		actionClock (AWrite cid e) = cid : exprChans e
+		actionClock (ALoop actions) = concatMap actionClock actions
+		actionClock (AGroup _ a b) = concatMap actionClock [a,b]
+		actionClock (AAssign a e) = exprChans e
+		actionClock a = internal $ "actionClock: "++show a
+		exprChans (SE _ e) = case e of
+			ERead cid -> [cid]
+			EBin _ a b -> exprChans a ++ exprChans b
+			EUn _ a -> exprChans a
+			EVar _ -> []
+			EConst _ -> []
+			e -> internal $ "exprChans "++show e
+		exprValidReady f (SE _ e) = case e of
+			ERead cid -> Just $ SE 1 $ EVar $ f cid
+			EConst _ -> Nothing
+			EVar _ -> Nothing
+			EBin _ a b -> foldrs $ catMaybes [exprValidReady f a, exprValidReady f b]
+			e -> internal $ "exprValidReady "++show e
+			where
+				foldrs [] = Nothing
+				foldrs rs = Just $ foldl1 (.&) rs
 		assignmentsFirst (AAssign (SE _ (EVar var)) expr) = do
 			case expr of
 				SE size (EConst c) -> modify $ \gs -> gs { gsDefaults = Map.insert var expr $ gsDefaults gs}
 				_ -> internal $ "not a constant in assigning "++show var
 		assignmentsFirst a = internal $ show a ++ " in assignmentsFirst."
+		addConvert (ALoop actions) = convertToExecPoint (ALoop actions)
 		addConvert action = do
 			this <- genCurrentLabel
 			next <- genNextLabel
@@ -766,13 +802,25 @@ genActionsExecPoints actions = do
 			addAssign startedB (SE 1 $ EBin And (SE 1 $ EVar started) (SE 1 $ EUn Not $ (SE 1 $ EVar succeedA)))
 			succeedB <- convertToExecPoint' startedB b
 			succeedAny <- succeedVar
-			addAssign succeedAny (SE 1 $ EBin Or (SE 1 $ EVar succeedA) (SE 1 $ EVar succeedB))
+			addAssign succeedAny ((SE 1 $ EVar succeedA) .| (SE 1 $ EVar succeedB))
 			return succeedAny
 		convertToExecPoint' succeed (AAssign (SE _ (EVar v)) sizedE) = do
+			let valid = exprValidReady genChanValid sizedE
 			addAssign v sizedE
-			return succeed
+			succeed' <- case valid of
+				Just e -> do
+					succeed' <- succeedVar
+					addAssign succeed' $ (SE 1 $ EVar succeed) .& e
+					return succeed'
+				Nothing -> return succeed
+			return succeed'
 		convertToExecPoint' succeed ANop = return succeed
 		convertToExecPoint' succeed (AWrite chan expr) = do
+			addAssign (genChanData chan) expr
+			succeed' <- succeedVar
+			let valid = exprValidReady genChanValid expr
+			    withValid e = maybe e (e .&) valid
+			addAssign succeed' $ (SE 1 $ EVar $ genChanReady chan) .& withValid (SE 1 $ EVar succeed)
 			return succeed
 		convertToExecPoint' succeed (AFail cond) = do
 			v <- succeedVar
@@ -785,11 +833,35 @@ genDumpExecPoints = do
 	l <- genLanguage
 	eps <- liftM gsPoints get
 	genComment "Declarations."
-	forM_ (nub $ concatMap epsDecls eps) $ declare l
+	genNL
+	forM_ eps $ declare l
+	genNL
 	genComment "State changing assignments as combinational logic."
 	forM_ (concatMap epAssignments eps) $ assign l
+	genNL
+	genComment "Labels changing code."
+	genComment $ show eps
+	genNL
+	forM_ (zip (True:repeat False) eps) $ \(first, ep) -> labelChanges l first ep
 	return ()
 	where
+		labelChanges lang first ep = do
+			let label = genVarName $ epLabel ep
+			clk <- liftM gsClock get
+			let rst = clockReset clk
+			case lang of
+				VHDL -> internal "label clock VHDL."
+				Verilog -> do
+					let edge' c = if c then "posedge" else "negedge"
+					    edge = edge' $ clockFrontEdge clk
+					    resetSens = if resetAsynchronous rst then " or "++edge' (resetHighActive rst) else ""
+					genLine $ "always @("++edge++" "++clockName clk++resetSens++") begin"
+					genNest $ do
+						genLine $ "if ("++(if resetHighActive rst then "" else "!")++resetName rst++") begin"
+						genNest $ genLine $ unwords [label,"<=", if first then "1" else "0"]++";"
+						genLine "end else begin"
+						genNest $ genLine $ unwords [label, "<= 1"]++";"
+						genLine "end"
 		assign Verilog (var, expr) = 
 			genLine $ unwords ["assign",genVarName var, "=", vlogExpr expr]++";"
 		assign VHDL (var, expr) =
@@ -825,13 +897,16 @@ genDumpExecPoints = do
 			ESlice e ofs -> concat [vlogExpr e, "[",show (ofs+size-1),":", show ofs,"]"]
 			ERead c -> genChanName c
 			EWild -> ""
-		declare Verilog (size, var) = do
-			genLine $ unwords ["wire", sizeDecl, genVarName var]++";"
+		declare lang ep = do
+			forM_ (nub $ epsDecls ep) $ declareAsgn False lang
+			declareAsgn True lang (1, epLabel ep)
+		declareAsgn reg Verilog (size, var) = do
+			genLine $ unwords [if reg then "reg" else "wire", sizeDecl, genVarName var]++";"
 			where
 				sizeDecl
 					| size < 2 = ""
 					| otherwise = concat ["[",show (size-1),":0]"]
-		declare VHDL (size, var) = do
+		declareAsgn _ VHDL (size, var) = do
 			genLine $ unwords ["signal",genVarName var,":",sizeDecl]++";"
 			where
 				sizeDecl

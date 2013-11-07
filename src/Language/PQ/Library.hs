@@ -16,9 +16,10 @@ import Language.PQ.Base
 -- |Simple "identity" process.
 idP :: BitRepr a => Process (a :. Nil) (a :. Nil)
 idP = process "id" ("in_data" :. Nil) ("out_data" :. Nil) $ \(input :. Nil) (output :. Nil) -> do
-	x <- def "x"
+--	x <- def "x"
 	loop $ do
-		x $= readC input &&& writeC output x
+--		x $= readC input &&& writeC output x
+		writeC output (readC input)
 
 -- |A buffer delay for one clock tick.
 bufP :: BitRepr a => Process (a :. Nil) (a :. Nil)
