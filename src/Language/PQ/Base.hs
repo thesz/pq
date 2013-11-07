@@ -587,6 +587,7 @@ data Language = Verilog | VHDL
 data ExecPoint = ExecPoint {
 	  epLabel		:: VarID
 	, epAssignments		:: [(VarID, SizedExpr)]
+	, epSucceedVar		:: VarID
 	, epControlFlow		:: ([(SizedExpr, VarID)], VarID)
 	}
 	deriving (Eq, Ord, Show)
@@ -601,6 +602,7 @@ data GenS = GS {
 	, gsSeenProcesses	:: Map.Map Proc	String
 	, gsLines		:: [String]
 	, gsNest		:: String
+	, gsDeclared		:: Set.Set VarID
 	}
 	deriving (Eq, Ord, Show)
 
@@ -615,6 +617,7 @@ startGenS l = GS {
 	, gsSeenProcesses	= Map.empty
 	, gsLines		= []
 	, gsNest		= ""
+	, gsDeclared		= Set.empty
 	}
 
 type GenM a = State GenS a
@@ -663,6 +666,12 @@ genChanData (ChanID _ _ names) = VarID (names) []
 genVarName :: VarID -> String
 genVarName (VarID names indices) = intercalate "_" $ names ++ map show indices
 
+genAddDeclared :: VarID -> GenM ()
+genAddDeclared v = modify $ \gs -> gs { gsDeclared = Set.insert v $ gsDeclared gs }
+
+genIsNotDeclared :: VarID -> GenM Bool
+genIsNotDeclared v = liftM (not . Set.member v . gsDeclared) get
+
 genHeader :: String -> Proc -> GenM ()
 genHeader n process = do
 	genNL
@@ -673,7 +682,7 @@ genHeader n process = do
 			genLine $ "module "++n
 			genNest $ do
 				forM_ (zip ("(" : repeat ",") clocksResets) $ \(c,i) -> genLine $ c++" input "++replicate 14 ' '++i
-				forM_ ios $ \d -> genLine $ ", "++d
+				forM_ ios $ \(d,v) -> do { genLine $ ", "++d; genAddDeclared v}
 				genLine ");"
 			genNL
 		VHDL -> error "header generation for VHDL."
@@ -689,8 +698,9 @@ genHeader n process = do
 		genChan dirTo dirFrom cid@(ChanID size _ name) =
 			dataIO ++ [declare dirTo 1 genChanValid, declare dirFrom 1 genChanReady]
 			where
-				declare dir size f = unwords [dir, sizeDecl, genVarName $ f cid]
+				declare dir size f = (unwords [dir, sizeDecl, genVarName $ f cid], v)
 					where
+						v = f cid
 						sizeDecl
 							| size < 2 = replicate 12 ' '
 							| otherwise = take 12 $ concat ["[", show (size-1),":0]"]++repeat ' '
@@ -718,12 +728,16 @@ genChangeLabel origL toL = modify $ \gs -> gs {
 	  gsPoints = map changeL $ gsPoints gs
 	}
 	where
-		changeL (ExecPoint label assignments (condChanges, elseChange)) =
-			ExecPoint label assignments (map condChange condChanges, change elseChange)
+		changeL (ExecPoint label assignments succeed (condChanges, elseChange)) =
+			ExecPoint label assignments succeed (map condChange condChanges, change elseChange)
 		condChange (e,l) = (e,change l)
 		change l
 			| l == origL = toL
 			| otherwise = l
+
+genNextLabelI :: GenM ()
+genNextLabelI = modify $ \gs -> gs { gsLabelI = gsLabelI gs + 1 }
+
 
 genActionsExecPoints :: [Action] -> GenM ()
 genActionsExecPoints actions = do
@@ -767,9 +781,14 @@ genActionsExecPoints actions = do
 		addConvert action = do
 			this <- genCurrentLabel
 			next <- genNextLabel
-			let execPoint = ExecPoint this [] ([], next)
+			let execPoint = ExecPoint this [] (internal "no succeed var") ([], next)
 			modify $ \gs -> gs { gsPoints = execPoint : gsPoints gs }
-			convertToExecPoint action
+			succeed <- convertToExecPoint' this action
+			onTopEP $ \ep -> ep {
+				  epSucceedVar = succeed
+				}
+			genNextLabelI
+			return ()
 		-- top-level conversion function.
 		convertToExecPoint (ALoop actions) = do
 			begin <- genCurrentLabel
@@ -834,18 +853,26 @@ genDumpExecPoints = do
 	eps <- liftM gsPoints get
 	genComment "Declarations."
 	genNL
+	forM_ eps $ declareLabel l
 	forM_ eps $ declare l
 	genNL
 	genComment "State changing assignments as combinational logic."
 	forM_ (concatMap epAssignments eps) $ assign l
 	genNL
 	genComment "Labels changing code."
-	genComment $ show eps
+	mapM_ (genComment . show) eps
 	genNL
 	forM_ (zip (True:repeat False) eps) $ \(first, ep) -> labelChanges l first ep
 	return ()
 	where
+		referrers ep = liftM (concatMap refs . gsPoints) get
+			where
+				refs ep'
+					| not (null $ fst $ epControlFlow ep') = internal $ "complete control flow is not supported."
+					| snd (epControlFlow ep') == epLabel ep = [epLabel ep']
+					| otherwise = []
 		labelChanges lang first ep = do
+			refs <- referrers ep
 			let label = genVarName $ epLabel ep
 			clk <- liftM gsClock get
 			let rst = clockReset clk
@@ -860,7 +887,7 @@ genDumpExecPoints = do
 						genLine $ "if ("++(if resetHighActive rst then "" else "!")++resetName rst++") begin"
 						genNest $ genLine $ unwords [label,"<=", if first then "1" else "0"]++";"
 						genLine "end else begin"
-						genNest $ genLine $ unwords [label, "<= 1"]++";"
+						genNest $ genLine $ unwords [label, "<=", unwords $ intersperse "||" (map genVarName refs)]++";"
 						genLine "end"
 		assign Verilog (var, expr) = 
 			genLine $ unwords ["assign",genVarName var, "=", vlogExpr expr]++";"
@@ -897,11 +924,11 @@ genDumpExecPoints = do
 			ESlice e ofs -> concat [vlogExpr e, "[",show (ofs+size-1),":", show ofs,"]"]
 			ERead c -> genChanName c
 			EWild -> ""
+		declareLabel lang ep = declareAsgn True lang (1, epLabel ep)
 		declare lang ep = do
 			forM_ (nub $ epsDecls ep) $ declareAsgn False lang
-			declareAsgn True lang (1, epLabel ep)
 		declareAsgn reg Verilog (size, var) = do
-			genLine $ unwords [if reg then "reg" else "wire", sizeDecl, genVarName var]++";"
+			genIsNotDeclared var >>= flip when ((genLine $ unwords [if reg then "reg" else "wire", sizeDecl, genVarName var]++";") >> genAddDeclared var)
 			where
 				sizeDecl
 					| size < 2 = ""
