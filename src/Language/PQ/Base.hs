@@ -586,7 +586,7 @@ data Language = Verilog | VHDL
 
 data ExecPoint = ExecPoint {
 	  epLabel		:: VarID
-	, epAssignments		:: [(VarID, SizedExpr)]
+	, epFirst		:: Bool
 	, epSucceedVar		:: VarID
 	, epControlFlow		:: ([(SizedExpr, VarID)], VarID)
 	}
@@ -603,6 +603,8 @@ data GenS = GS {
 	, gsLines		:: [String]
 	, gsNest		:: String
 	, gsDeclared		:: Set.Set VarID
+	, gsAssignments		:: [(VarID, SizedExpr)]
+	, gsRegAssignments	:: [(VarID, SizedExpr)]
 	}
 	deriving (Eq, Ord, Show)
 
@@ -618,6 +620,8 @@ startGenS l = GS {
 	, gsLines		= []
 	, gsNest		= ""
 	, gsDeclared		= Set.empty
+	, gsAssignments		= []
+	, gsRegAssignments	= []
 	}
 
 type GenM a = State GenS a
@@ -728,8 +732,8 @@ genChangeLabel origL toL = modify $ \gs -> gs {
 	  gsPoints = map changeL $ gsPoints gs
 	}
 	where
-		changeL (ExecPoint label assignments succeed (condChanges, elseChange)) =
-			ExecPoint label assignments succeed (map condChange condChanges, change elseChange)
+		changeL (ExecPoint label succeed (condChanges, elseChange)) =
+			ExecPoint label succeed (map condChange condChanges, change elseChange)
 		condChange (e,l) = (e,change l)
 		change l
 			| l == origL = toL
@@ -746,7 +750,22 @@ genActionsExecPoints actions = do
 	mapM_ addConvert body
 	modify $ \gs -> gs { gsPoints = reverse $ gsPoints gs }
 	modify $ \gs -> gs { gsClock = actionsClock}
+	assignLabelsRegs
 	where
+		referrers ep = liftM (concatMap refs . gsPoints) get
+			where
+				refs ep'
+					| not (null $ fst $ epControlFlow ep') = internal $ "complete control flow is not supported."
+					| snd (epControlFlow ep') == epLabel ep = [ep']
+					| otherwise = []
+		assignLabelsRegs = do
+			eps <- liftM gsPoints get
+			forM_ eps $ \ep -> do
+				modify $ \gs -> gs { gsDefaults = Map.insert (epLabel ep) (if epFirst ep then eTrue else eFalse) $ gsDefaults gs }
+				let logicEV v = SE 1 $ EVar v
+				    succeed ep = logicEV (epLabel ep) .& logicEV (epSucceedVar ep)
+				refs <- referrers ep
+				modify $ \gs -> gs { gsRegAssignments = (epLabel, foldl1 (.|) $ map succeed refs) : gsRegAssignments gs }
 		actionsClock = case nubBy (\a b -> cidClockInfo a == cidClockInfo b) $ concatMap actionClock actions of
 			[] -> error $ "No channel operations detected, cannot determine what clock to use."
 			[c] -> cidClockInfo c
@@ -781,7 +800,7 @@ genActionsExecPoints actions = do
 		addConvert action = do
 			this <- genCurrentLabel
 			next <- genNextLabel
-			let execPoint = ExecPoint this [] (internal "no succeed var") ([], next)
+			let execPoint = ExecPoint this (internal "no succeed var") ([], next)
 			modify $ \gs -> gs { gsPoints = execPoint : gsPoints gs }
 			succeed <- convertToExecPoint' this action
 			onTopEP $ \ep -> ep {
@@ -807,8 +826,8 @@ genActionsExecPoints actions = do
 			}
 
 		addAssign var sizedExpr = do
-			onTopEP $ \ep -> ep { epAssignments = epAssignments ep ++ [(var, sizedExpr)] }
-
+			modify $ \gs -> gs { gsAssignments = (var, sizedExpr) : gsAssignments gs }
+			
 		succeedVar = newVarID ["pq","succeed"]
 
 		-- conversion function of internals of exec point.
@@ -851,44 +870,20 @@ genDumpExecPoints :: GenM ()
 genDumpExecPoints = do
 	l <- genLanguage
 	eps <- liftM gsPoints get
+	asgns <- liftM gsAssignments get
+	regs <- liftM
 	genComment "Declarations."
 	genNL
-	forM_ eps $ declareLabel l
 	forM_ eps $ declare l
 	genNL
 	genComment "State changing assignments as combinational logic."
-	forM_ (concatMap epAssignments eps) $ assign l
+	forM_ asgns $ assign l
 	genNL
-	genComment "Labels changing code."
-	mapM_ (genComment . show) eps
+	genComment "All registers."
+	forM_ 
 	genNL
-	forM_ (zip (True:repeat False) eps) $ \(first, ep) -> labelChanges l first ep
 	return ()
 	where
-		referrers ep = liftM (concatMap refs . gsPoints) get
-			where
-				refs ep'
-					| not (null $ fst $ epControlFlow ep') = internal $ "complete control flow is not supported."
-					| snd (epControlFlow ep') == epLabel ep = [epLabel ep']
-					| otherwise = []
-		labelChanges lang first ep = do
-			refs <- referrers ep
-			let label = genVarName $ epLabel ep
-			clk <- liftM gsClock get
-			let rst = clockReset clk
-			case lang of
-				VHDL -> internal "label clock VHDL."
-				Verilog -> do
-					let edge' c = if c then "posedge" else "negedge"
-					    edge = edge' $ clockFrontEdge clk
-					    resetSens = if resetAsynchronous rst then " or "++edge' (resetHighActive rst) else ""
-					genLine $ "always @("++edge++" "++clockName clk++resetSens++") begin"
-					genNest $ do
-						genLine $ "if ("++(if resetHighActive rst then "" else "!")++resetName rst++") begin"
-						genNest $ genLine $ unwords [label,"<=", if first then "1" else "0"]++";"
-						genLine "end else begin"
-						genNest $ genLine $ unwords [label, "<=", unwords $ intersperse "||" (map genVarName refs)]++";"
-						genLine "end"
 		assign Verilog (var, expr) = 
 			genLine $ unwords ["assign",genVarName var, "=", vlogExpr expr]++";"
 		assign VHDL (var, expr) =
@@ -924,9 +919,11 @@ genDumpExecPoints = do
 			ESlice e ofs -> concat [vlogExpr e, "[",show (ofs+size-1),":", show ofs,"]"]
 			ERead c -> genChanName c
 			EWild -> ""
-		declareLabel lang ep = declareAsgn True lang (1, epLabel ep)
 		declare lang ep = do
-			forM_ (nub $ epsDecls ep) $ declareAsgn False lang
+			regs <- liftM (map (\(v,se) -> (seSize se, v)) . gsRegAssignments) get
+			forM_ regs $ declareAsgn True lang
+			asgns <- liftM gsAssignments get
+			forM_ (nub $ concatMap asgnDecls asgns) $ declareAsgn False lang
 		declareAsgn reg Verilog (size, var) = do
 			genIsNotDeclared var >>= flip when ((genLine $ unwords [if reg then "reg" else "wire", sizeDecl, genVarName var]++";") >> genAddDeclared var)
 			where
@@ -939,7 +936,6 @@ genDumpExecPoints = do
 				sizeDecl
 					| size < 2 = "bit"
 					| otherwise = concat ["unsigned(", show (size-1)," downto 0)"]
-		epsDecls = concatMap asgnDecls . epAssignments
 		asgnDecls (var, e@(SE size _)) = [(size, var)] ++ exprDecls e
 		exprDecls (SE size e) = case e of
 			EConst	_ -> []
